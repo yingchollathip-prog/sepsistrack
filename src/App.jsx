@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import * as XLSX from "xlsx";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -833,7 +833,7 @@ export default function App() {
         {/* Main */}
         <main className="view">
           {view==="board"    && <BoardView    cases={sortedActive} completed={completedCases} tick={tick} onAdd={() => setShowForm(true)} onDetail={setDetailId} isAdmin={isAdmin} onDelete={setDeleteTarget} />}
-          {view==="patients" && <PatientsView cases={sortedActive} tick={tick} onAdd={() => setShowForm(true)} onAdvance={advanceStep} onUpdateDelay={updateDelay} onDetail={setDetailId} isAdmin={isAdmin} onDelete={setDeleteTarget} />}
+          {view==="patients" && <PatientsView cases={sortedActive} tick={tick} onAdd={() => setShowForm(true)} onAdvance={advanceStep} onUpdateDelay={updateDelay} onDetail={setDetailId} isAdmin={isAdmin} onDelete={setDeleteTarget} savingCaseId={savingCaseId} />}
           {view==="history"  && <HistoryView  cases={completedCases} onDetail={setDetailId} exportCSV={exportCSV} exportXLSX={exportXLSX} isAdmin={isAdmin} onDelete={setDeleteTarget} />}
           {view==="monthly"  && <MonthlyView  cases={completedCases} exportCSV={exportCSV} exportXLSX={exportXLSX} isAdmin={isAdmin} />}
           {view==="report"   && <ReportView   cases={[...activeCases,...completedCases]} completed={completedCases} withinHour={withinHour} avgMin={avgMin} compliance={compliance} exportCSV={exportCSV} exportXLSX={exportXLSX} isAdmin={isAdmin} />}
@@ -985,9 +985,28 @@ function BoardRowDone({ c, onClick, isAdmin, onDelete }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Error Boundary — catches render errors in child components
+// ═══════════════════════════════════════════════════════════════════════════════
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { hasError: false, error: null }; }
+  static getDerivedStateFromError(error) { return { hasError: true, error }; }
+  componentDidCatch(error, info) { console.error("❌ Render error:", error, info); }
+  render() {
+    if (this.state.hasError) return (
+      <div style={{background:"rgba(245,0,87,.08)",border:"1px solid var(--red)",borderRadius:8,padding:16,margin:"10px 0"}}>
+        <div style={{color:"var(--red)",fontWeight:700,marginBottom:6}}>⚠ Display error in this card</div>
+        <div style={{fontSize:".72rem",color:"var(--muted)",marginBottom:10}}>{String(this.state.error?.message || "Unknown error")}</div>
+        <button className="btn btn-g" style={{padding:"5px 12px"}} onClick={() => this.setState({hasError:false,error:null})}>Retry</button>
+      </div>
+    );
+    return this.props.children;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Patients View
 // ═══════════════════════════════════════════════════════════════════════════════
-function PatientsView({ cases, tick, onAdd, onAdvance, onUpdateDelay, onDetail, isAdmin, onDelete }) {
+function PatientsView({ cases, tick, onAdd, onAdvance, onUpdateDelay, onDetail, isAdmin, onDelete, savingCaseId }) {
   return (
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
@@ -998,7 +1017,11 @@ function PatientsView({ cases, tick, onAdd, onAdvance, onUpdateDelay, onDetail, 
         <div className="empty"><div className="eicon">🏥</div><div>No active patients.</div></div>
       ) : (
         <div className="pgrid">
-          {cases.map(c => <PatientCard key={c.CaseID} c={c} tick={tick} onAdvance={onAdvance} onUpdateDelay={onUpdateDelay} onDetail={onDetail} isAdmin={isAdmin} onDelete={onDelete} isSaving={savingCaseId===c.CaseID} />)}
+          {cases.map(c => (
+          <ErrorBoundary key={c.CaseID}>
+            <PatientCard c={c} tick={tick} onAdvance={onAdvance} onUpdateDelay={onUpdateDelay} onDetail={onDetail} isAdmin={isAdmin} onDelete={onDelete} isSaving={savingCaseId===c.CaseID} />
+          </ErrorBoundary>
+        ))}
         </div>
       )}
     </div>
@@ -1006,18 +1029,18 @@ function PatientsView({ cases, tick, onAdd, onAdvance, onUpdateDelay, onDetail, 
 }
 
 function PatientCard({ c, tick, onAdvance, onUpdateDelay, onDetail, isAdmin, onDelete, isSaving }) {
+  // Guard: if case data is missing critical fields, show a safe placeholder
+  if (!c || !c.CaseID) return null;
+
   const el           = elapsedSec(c.SepsisRecognitionTime);
-  // Consider "done" if Status=completed OR if ATBAdministeredTime is set
   const administered = !!(c._steps?.administered || c.ATBAdministeredTime);
   const done         = c.Status === "completed" || administered;
   const u    = urgencyOf(el, done);
-  const col  = U_COLOR[u];
+  const col  = U_COLOR[u] || "#546e7a";
   const remaining = DEADLINE_SEC - el;
   const pct  = Math.min(100, (el/DEADLINE_SEC)*100);
-  // Use getStepFromCase which checks both flat fields AND _steps
   const step     = getStepFromCase(c);
   const nextStep = STATUS_STEPS[STATUS_STEPS.findIndex(s=>s.key===step)+1];
-  // Never show a step button for a step that is already done
   const canAdvance = nextStep && !administered && STEP_RANK[step] < 3;
 
   return (

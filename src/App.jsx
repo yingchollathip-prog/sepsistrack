@@ -820,7 +820,7 @@ export default function App() {
             {overdueCases.length > 0 && <span className="livebadge" style={{background:"#c62828"}}>⚠ {overdueCases.length} OVERDUE</span>}
           </div>
           <nav className="nav">
-            {[["board","🖥 Alert Board"],["patients","🏥 Patients"],["history","📂 History"],["monthly","📅 Monthly"],["report","📊 Report"],["audit","🔐 Audit"]].map(([k,l]) => (
+            {[["board","🖥 Alert Board"],["patients","🏥 Patients"],["history","📂 History"],["monthly","📅 Monthly"],["report","📊 Report"]].map(([k,l]) => (
               <button key={k} className={`nb${view===k?" on":""}`} onClick={() => setView(k)}>{l}</button>
             ))}
           </nav>
@@ -854,7 +854,7 @@ export default function App() {
           {view==="history"  && <HistoryView  cases={completedCases} onDetail={setDetailId} exportCSV={exportCSV} exportXLSX={exportXLSX} isAdmin={isAdmin} onDelete={setDeleteTarget} />}
           {view==="monthly"  && <MonthlyView  cases={completedCases} exportCSV={exportCSV} exportXLSX={exportXLSX} isAdmin={isAdmin} />}
           {view==="report"   && <ReportView   cases={[...activeCases,...completedCases]} completed={completedCases} withinHour={withinHour} avgMin={avgMin} compliance={compliance} exportCSV={exportCSV} exportXLSX={exportXLSX} isAdmin={isAdmin} />}
-          {view==="audit"    && <AuditView    log={auditLog} deletedCases={cases.filter(c=>c.IsDeleted)} exportCSV={exportCSV} exportXLSX={exportXLSX} />}
+
         </main>
 
         {/* Save error banner */}

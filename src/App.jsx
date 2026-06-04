@@ -520,14 +520,24 @@ export default function App() {
       try {
         const fresh = await sheetsGet("getCases");
         if (fresh && Array.isArray(fresh)) {
-          // Merge: keep local _steps and _alerts runtime fields
+          // Merge: always use Sheets data for _steps (source of truth)
+          // Only keep local _alerts (UI-only, not stored in Sheets)
           setCases(prev => {
             const prevMap = Object.fromEntries(prev.map(c => [c.CaseID, c]));
-            return fresh.map(c => ({
-              ...c,
-              _steps:  prevMap[c.CaseID]?._steps  || c._steps  || {},
-              _alerts: prevMap[c.CaseID]?._alerts || c._alerts || {},
-            }));
+            return fresh.map(c => {
+              // Rebuild _steps from Sheets timestamp columns (always fresh)
+              const steps = {
+                recognized:   c.SepsisRecognitionTime  || null,
+                ordered:      c.ATBOrderTime            || null,
+                prepared:     c.ATBPreparedTime         || null,
+                administered: c.ATBAdministeredTime     || null,
+              };
+              return {
+                ...c,
+                _steps:  steps,
+                _alerts: prevMap[c.CaseID]?._alerts || {},
+              };
+            });
           });
           setSyncStatus("online");
         }
@@ -628,25 +638,36 @@ export default function App() {
       if (c.CaseID !== caseId) return c;
       const ts = nowISO();
       const updated = { ...c, UpdatedAt: ts };
-      if (!updated.ATBOrderTime)         { updated.ATBOrderTime = ts;     updated._steps = {...c._steps, ordered: ts}; }
-      else if (!updated.ATBPreparedTime) { updated.ATBPreparedTime = ts;  updated._steps = {...c._steps, prepared: ts}; }
-      else if (!updated.ATBAdministeredTime) {
+      if (!updated.ATBOrderTime) {
+        updated.ATBOrderTime = ts;
+        updated._steps = { ...c._steps, recognized: c.SepsisRecognitionTime, ordered: ts };
+      } else if (!updated.ATBPreparedTime) {
+        updated.ATBPreparedTime = ts;
+        updated._steps = { ...c._steps, prepared: ts };
+      } else if (!updated.ATBAdministeredTime) {
         updated.ATBAdministeredTime = ts;
-        updated.CompletedTime = ts;
-        updated.Status = "completed";
-        const total = diffMin(updated.SepsisRecognitionTime, ts);
+        updated.CompletedTime       = ts;
+        updated.Status              = "completed";
+        const total                 = diffMin(updated.SepsisRecognitionTime, ts);
         updated.TotalTimeToATBMinutes = total ? +total.toFixed(1) : null;
-        updated.WithinOneHour = total !== null ? (total <= 60 ? "Yes" : "No") : null;
-        updated._steps = {...c._steps, administered: ts};
+        updated.WithinOneHour         = total !== null ? (total <= 60 ? "Yes" : "No") : null;
+        updated._steps = {
+          recognized:   c.SepsisRecognitionTime,
+          ordered:      c.ATBOrderTime,
+          prepared:     c.ATBPreparedTime,
+          administered: ts,
+        };
       }
       updatedCase = updated;
       return updated;
     }));
-    // Persist to Google Sheets
+    // Persist to Google Sheets — send full case so all columns update correctly
     if (updatedCase) {
       try {
         await sheetsPost({ action: "updateCase", case: updatedCase });
+        setSyncStatus("online");
       } catch(e) {
+        setSyncStatus("offline");
         console.error("Failed to sync step to Sheets:", e);
       }
     }
@@ -923,8 +944,10 @@ function PatientsView({ cases, tick, onAdd, onAdvance, onUpdateDelay, onDetail, 
 }
 
 function PatientCard({ c, tick, onAdvance, onUpdateDelay, onDetail, isAdmin, onDelete }) {
-  const el   = elapsedSec(c.SepsisRecognitionTime);
-  const done = c.Status === "completed";
+  const el           = elapsedSec(c.SepsisRecognitionTime);
+  // Consider "done" if Status=completed OR if ATBAdministeredTime is set
+  const administered = !!(c._steps?.administered || c.ATBAdministeredTime);
+  const done         = c.Status === "completed" || administered;
   const u    = urgencyOf(el, done);
   const col  = U_COLOR[u];
   const remaining = DEADLINE_SEC - el;
@@ -943,16 +966,21 @@ function PatientCard({ c, tick, onAdvance, onUpdateDelay, onDetail, isAdmin, onD
         <span className="ubadge" style={{background:U_BG[u],color:col,border:`1px solid ${col}`}}>{U_LABEL[u]}</span>
       </div>
 
-      <div className="bigtimer" style={{color:col}}>{secsToMMSS(el)}</div>
-      <div className="tlabel">TIME ELAPSED SINCE RECOGNITION</div>
-      <div className="barwrap"><div className="bar" style={{width:`${pct}%`,background:col}}/></div>
-      <div style={{display:"flex",justifyContent:"space-between",fontSize:".6rem",color:"var(--muted)"}}>
-        <span>0:00</span>
-        <span style={{color:remaining>0?col:"#ff1744",fontWeight:700}}>
-          {remaining>0?`${secsToMMSS(remaining)} remaining`:`OVERDUE ${secsToMMSS(-remaining)}`}
-        </span>
-        <span>60:00</span>
-      </div>
+      {/* Only show countdown timer if not yet completed */}
+      {!administered && (
+        <>
+          <div className="bigtimer" style={{color:col}}>{secsToMMSS(el)}</div>
+          <div className="tlabel">TIME ELAPSED SINCE RECOGNITION</div>
+          <div className="barwrap"><div className="bar" style={{width:`${pct}%`,background:col}}/></div>
+          <div style={{display:"flex",justifyContent:"space-between",fontSize:".6rem",color:"var(--muted)"}}>
+            <span>0:00</span>
+            <span style={{color:remaining>0?col:"#ff1744",fontWeight:700}}>
+              {remaining>0?`${secsToMMSS(remaining)} remaining`:`OVERDUE ${secsToMMSS(-remaining)}`}
+            </span>
+            <span>60:00</span>
+          </div>
+        </>
+      )}
 
       <div className="igrid">
         <div className="ii"><label>Source</label><span>{c.SuspectedSource}</span></div>

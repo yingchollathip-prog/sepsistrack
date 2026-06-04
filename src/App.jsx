@@ -74,12 +74,28 @@ const U_COLOR  = { green:"#00e676", yellow:"#ffea00", orange:"#ff6d00", red:"#f5
 const U_LABEL  = { green:"GREEN", yellow:"CAUTION", orange:"WARNING", red:"CRITICAL", overdue:"OVERDUE", done:"COMPLETED" };
 const U_BG     = { green:"rgba(0,230,118,.12)", yellow:"rgba(255,234,0,.09)", orange:"rgba(255,109,0,.12)", red:"rgba(245,0,87,.12)", overdue:"rgba(183,28,28,.22)", done:"rgba(84,110,122,.2)" };
 
+// Read current step from a case object — checks both flat fields and _steps
+// Flat fields (ATBOrderTime etc.) are the source of truth from Sheets.
 const currentStepKey = (steps) => {
   if (!steps.ordered)      return "recognized";
   if (!steps.prepared)     return "ordered";
   if (!steps.administered) return "prepared";
   return "administered";
 };
+
+// Get the highest step a case has reached, checking BOTH flat fields and _steps
+const getStepFromCase = (c) => {
+  const administered = c.ATBAdministeredTime || c._steps?.administered;
+  const prepared     = c.ATBPreparedTime     || c._steps?.prepared;
+  const ordered      = c.ATBOrderTime        || c._steps?.ordered;
+  if (administered) return "administered";
+  if (prepared)     return "prepared";
+  if (ordered)      return "ordered";
+  return "recognized";
+};
+
+// Step rank — higher is further along. Steps can only go forward.
+const STEP_RANK = { recognized: 0, ordered: 1, prepared: 2, administered: 3 };
 
 const buildCase = (form, id) => {
   const ts = nowISO();
@@ -512,18 +528,28 @@ export default function App() {
           setCases(prev => {
             const prevMap = Object.fromEntries(prev.map(c => [c.CaseID, c]));
             return fresh.map(c => {
-              // Rebuild _steps from Sheets timestamp columns (always fresh)
-              const steps = {
+              const prev_c = prevMap[c.CaseID];
+              // Rebuild _steps from flat timestamp columns — these are the source of truth
+              const sheetsSteps = {
                 recognized:   c.SepsisRecognitionTime  || null,
                 ordered:      c.ATBOrderTime            || null,
                 prepared:     c.ATBPreparedTime         || null,
                 administered: c.ATBAdministeredTime     || null,
               };
-              return {
-                ...c,
-                _steps:  steps,
-                _alerts: prevMap[c.CaseID]?._alerts || {},
-              };
+              // Merge: take the HIGHEST step seen (never go backward)
+              const merged = { ...sheetsSteps };
+              if (prev_c) {
+                const prevSteps = prev_c._steps || {};
+                // Keep local step if Sheets doesn't have it yet (write still in flight)
+                if (!merged.ordered      && prevSteps.ordered)      merged.ordered      = prevSteps.ordered;
+                if (!merged.prepared     && prevSteps.prepared)     merged.prepared     = prevSteps.prepared;
+                if (!merged.administered && prevSteps.administered) merged.administered = prevSteps.administered;
+                // Also update flat fields from local if Sheets not yet saved
+                if (!c.ATBOrderTime      && prev_c.ATBOrderTime)      c = {...c, ATBOrderTime:      prev_c.ATBOrderTime};
+                if (!c.ATBPreparedTime   && prev_c.ATBPreparedTime)   c = {...c, ATBPreparedTime:   prev_c.ATBPreparedTime};
+                if (!c.ATBAdministeredTime && prev_c.ATBAdministeredTime) c = {...c, ATBAdministeredTime: prev_c.ATBAdministeredTime, Status: prev_c.Status || c.Status};
+              }
+              return { ...c, _steps: merged, _alerts: prev_c?._alerts || {} };
             });
           });
           setSyncStatus("online");
@@ -657,23 +683,27 @@ export default function App() {
     let stepTs   = null;
     lockWrites(15000);
 
-    // Optimistic update — change UI immediately
     setCases(prev => prev.map(c => {
       if (c.CaseID !== caseId) return c;
       const ts      = nowISO();
       const updated = { ...c, UpdatedAt: ts };
 
-      if (!updated.ATBOrderTime) {
+      // Use flat fields as source of truth — never go back
+      const alreadyOrdered      = !!(c.ATBOrderTime      || c._steps?.ordered);
+      const alreadyPrepared     = !!(c.ATBPreparedTime   || c._steps?.prepared);
+      const alreadyAdministered = !!(c.ATBAdministeredTime || c._steps?.administered);
+
+      if (!alreadyOrdered) {
         stepName = "ordered"; stepTs = ts;
         updated.ATBOrderTime = ts;
-        updated._steps = { ...c._steps, recognized: c.SepsisRecognitionTime, ordered: ts };
+        updated._steps = { recognized: c.SepsisRecognitionTime, ordered: ts, prepared: null, administered: null };
 
-      } else if (!updated.ATBPreparedTime) {
+      } else if (!alreadyPrepared) {
         stepName = "prepared"; stepTs = ts;
         updated.ATBPreparedTime = ts;
-        updated._steps = { ...c._steps, prepared: ts };
+        updated._steps = { recognized: c.SepsisRecognitionTime, ordered: c.ATBOrderTime||c._steps?.ordered, prepared: ts, administered: null };
 
-      } else if (!updated.ATBAdministeredTime) {
+      } else if (!alreadyAdministered) {
         stepName = "administered"; stepTs = ts;
         updated.ATBAdministeredTime = ts;
         updated.CompletedTime       = ts;
@@ -683,15 +713,17 @@ export default function App() {
         updated.WithinOneHour         = total !== null ? (total <= 60 ? "Yes" : "No") : null;
         updated._steps = {
           recognized:   c.SepsisRecognitionTime,
-          ordered:      c.ATBOrderTime,
-          prepared:     c.ATBPreparedTime,
+          ordered:      c.ATBOrderTime      || c._steps?.ordered,
+          prepared:     c.ATBPreparedTime   || c._steps?.prepared,
           administered: ts,
         };
+      } else {
+        // All steps already done — do nothing
+        console.log("⚠️ All steps already completed for", caseId);
       }
       return updated;
     }));
 
-    // Save step to Sheets — simple GET params, no body
     if (stepName) {
       try {
         await sheetsCall({ action: "updateStep", CaseID: caseId, step: stepName, ts: stepTs });
@@ -981,8 +1013,11 @@ function PatientCard({ c, tick, onAdvance, onUpdateDelay, onDetail, isAdmin, onD
   const col  = U_COLOR[u];
   const remaining = DEADLINE_SEC - el;
   const pct  = Math.min(100, (el/DEADLINE_SEC)*100);
-  const step = currentStepKey(c._steps||{});
+  // Use getStepFromCase which checks both flat fields AND _steps
+  const step     = getStepFromCase(c);
   const nextStep = STATUS_STEPS[STATUS_STEPS.findIndex(s=>s.key===step)+1];
+  // Never show a step button for a step that is already done
+  const canAdvance = nextStep && !administered && STEP_RANK[step] < 3;
 
   return (
     <div className="card" style={{"--cc":col}}>
@@ -1020,7 +1055,14 @@ function PatientCard({ c, tick, onAdvance, onUpdateDelay, onDetail, isAdmin, onD
 
       <div className="strack">
         {STATUS_STEPS.map(s => {
-          const ts = c._steps?.[s.key];
+          // Check both flat fields and _steps — flat fields are source of truth
+          const flatMap = {
+            recognized:   c.SepsisRecognitionTime,
+            ordered:      c.ATBOrderTime,
+            prepared:     c.ATBPreparedTime,
+            administered: c.ATBAdministeredTime,
+          };
+          const ts     = flatMap[s.key] || c._steps?.[s.key];
           const isDone = !!ts;
           const isAct  = s.key === step && !isDone;
           return (
@@ -1036,7 +1078,7 @@ function PatientCard({ c, tick, onAdvance, onUpdateDelay, onDetail, isAdmin, onD
       {c.DelayReason && <div className="dreason">⚠ Delay: {c.DelayReason}{c.OtherDelayReasonDetail?" — "+c.OtherDelayReasonDetail:""}</div>}
 
       <div className="cactions">
-        {nextStep && !administered && <button className="btn btn-p" onClick={() => onAdvance(c.CaseID)}>{nextStep.icon} {nextStep.label}</button>}
+        {canAdvance && <button className="btn btn-p" onClick={() => onAdvance(c.CaseID)}>{nextStep.icon} {nextStep.label}</button>}
         <button className="btn btn-g" onClick={() => onDetail(c.CaseID)}>🔍</button>
         {isAdmin && <button className="btn btn-g" style={{color:"var(--red)",borderColor:"rgba(245,0,87,.4)",flex:"0 0 auto"}} onClick={() => onDelete(c)}>🗑</button>}
       </div>

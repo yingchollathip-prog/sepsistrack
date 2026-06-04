@@ -511,49 +511,77 @@ export default function App() {
     });
   }, []);
 
-  // Auto-refresh from Sheets every 15 seconds so all devices stay in sync
-  // Skips refresh if a write happened in the last 10 seconds (writeLock)
+  // ── Sync strategy ────────────────────────────────────────────────────────────
+  // LOCAL STATE IS MASTER. Sheets is a backup and source of NEW cases only.
+  // Rules:
+  //   1. Steps only go forward — never backward under any circumstance
+  //   2. Auto-refresh only ADDS new cases from other devices
+  //   3. For existing cases: only update fields that have MORE data than local
+  //   4. localStorage is kept in sync as offline fallback
+
+  const mergeCase = (local, fromSheets) => {
+    // Pick the highest step timestamp between local and Sheets
+    const best = (a, b) => (a && a !== "" && a !== "null") ? a : (b && b !== "" && b !== "null") ? b : null;
+    const order = best(local.ATBOrderTime,      fromSheets.ATBOrderTime);
+    const prep  = best(local.ATBPreparedTime,   fromSheets.ATBPreparedTime);
+    const admin = best(local.ATBAdministeredTime, fromSheets.ATBAdministeredTime);
+    const comp  = best(local.CompletedTime,     fromSheets.CompletedTime);
+    // Status: only upgrade, never downgrade
+    const statusRank = { active:1, completed:2, DELETED:3 };
+    const localRank  = statusRank[local.Status]  || 0;
+    const sheetsRank = statusRank[fromSheets.Status] || 0;
+    const status = sheetsRank > localRank ? fromSheets.Status : local.Status;
+    const steps = {
+      recognized:   local.SepsisRecognitionTime || fromSheets.SepsisRecognitionTime,
+      ordered:      order,
+      prepared:     prep,
+      administered: admin,
+    };
+    return {
+      ...fromSheets,     // start with Sheets data (has DelayReason etc.)
+      ...local,          // local overrides everything
+      ATBOrderTime:       order,
+      ATBPreparedTime:    prep,
+      ATBAdministeredTime:admin,
+      CompletedTime:      comp,
+      Status:             status,
+      TotalTimeToATBMinutes: admin ? (local.TotalTimeToATBMinutes || fromSheets.TotalTimeToATBMinutes) : null,
+      WithinOneHour:      admin ? (local.WithinOneHour || fromSheets.WithinOneHour) : null,
+      _steps:  steps,
+      _alerts: local._alerts || {},
+    };
+  };
+
   useEffect(() => {
     if (!loaded) return;
     const id = setInterval(async () => {
-      if (writeLockRef.current) {
-        console.log("Auto-refresh skipped — write in progress");
-        return;
-      }
       try {
         const fresh = await sheetsGet("getCases");
-        if (fresh && Array.isArray(fresh)) {
-          // Merge: always use Sheets data for _steps (source of truth)
-          // Only keep local _alerts (UI-only, not stored in Sheets)
-          setCases(prev => {
-            const prevMap = Object.fromEntries(prev.map(c => [c.CaseID, c]));
-            return fresh.map(c => {
-              const prev_c = prevMap[c.CaseID];
-              // Rebuild _steps from flat timestamp columns — these are the source of truth
-              const sheetsSteps = {
-                recognized:   c.SepsisRecognitionTime  || null,
-                ordered:      c.ATBOrderTime            || null,
-                prepared:     c.ATBPreparedTime         || null,
-                administered: c.ATBAdministeredTime     || null,
+        if (!fresh || !Array.isArray(fresh)) return;
+        setCases(prev => {
+          const prevMap = Object.fromEntries(prev.map(c => [c.CaseID, c]));
+          const result  = [...prev]; // start with ALL local cases
+          // Add new cases from Sheets that don't exist locally
+          fresh.forEach(sheetsCase => {
+            if (!prevMap[sheetsCase.CaseID]) {
+              // Brand new case from another device — add it
+              const steps = {
+                recognized:   sheetsCase.SepsisRecognitionTime || null,
+                ordered:      sheetsCase.ATBOrderTime          || null,
+                prepared:     sheetsCase.ATBPreparedTime       || null,
+                administered: sheetsCase.ATBAdministeredTime   || null,
               };
-              // Merge: take the HIGHEST step seen (never go backward)
-              const merged = { ...sheetsSteps };
-              if (prev_c) {
-                const prevSteps = prev_c._steps || {};
-                // Keep local step if Sheets doesn't have it yet (write still in flight)
-                if (!merged.ordered      && prevSteps.ordered)      merged.ordered      = prevSteps.ordered;
-                if (!merged.prepared     && prevSteps.prepared)     merged.prepared     = prevSteps.prepared;
-                if (!merged.administered && prevSteps.administered) merged.administered = prevSteps.administered;
-                // Also update flat fields from local if Sheets not yet saved
-                if (!c.ATBOrderTime      && prev_c.ATBOrderTime)      c = {...c, ATBOrderTime:      prev_c.ATBOrderTime};
-                if (!c.ATBPreparedTime   && prev_c.ATBPreparedTime)   c = {...c, ATBPreparedTime:   prev_c.ATBPreparedTime};
-                if (!c.ATBAdministeredTime && prev_c.ATBAdministeredTime) c = {...c, ATBAdministeredTime: prev_c.ATBAdministeredTime, Status: prev_c.Status || c.Status};
-              }
-              return { ...c, _steps: merged, _alerts: prev_c?._alerts || {} };
-            });
+              result.push({ ...sheetsCase, _steps: steps, _alerts: {} });
+              console.log("📥 New case from another device:", sheetsCase.CaseID);
+            } else {
+              // Existing case — merge, never downgrade
+              const idx = result.findIndex(c => c.CaseID === sheetsCase.CaseID);
+              if (idx !== -1) result[idx] = mergeCase(result[idx], sheetsCase);
+            }
           });
-          setSyncStatus("online");
-        }
+          return result;
+        });
+        setSyncStatus("online");
       } catch(e) {
         setSyncStatus("offline");
         console.warn("Auto-refresh failed:", e);
@@ -617,32 +645,9 @@ export default function App() {
     return (U_ORDER[ua]??9) - (U_ORDER[ub]??9);
   });
 
-  // Helper: lock writes for N ms, then do one immediate refresh to confirm Sheets saved
-  const lockWrites = (ms = 15000) => {
-    writeLockRef.current = true;
-    setTimeout(() => {
-      writeLockRef.current = false;
-      // Trigger one immediate refresh after lock releases
-      sheetsGet("getCases").then(fresh => {
-        if (fresh && Array.isArray(fresh)) {
-          setCases(prev => {
-            const prevMap = Object.fromEntries(prev.map(c => [c.CaseID, c]));
-            return fresh.map(c => ({
-              ...c,
-              _steps: {
-                recognized:   c.SepsisRecognitionTime  || null,
-                ordered:      c.ATBOrderTime            || null,
-                prepared:     c.ATBPreparedTime         || null,
-                administered: c.ATBAdministeredTime     || null,
-              },
-              _alerts: prevMap[c.CaseID]?._alerts || {},
-            }));
-          });
-          setSyncStatus("online");
-        }
-      }).catch(() => setSyncStatus("offline"));
-    }, ms);
-  };
+  // lockWrites — not needed anymore since auto-refresh never overwrites local
+  // Kept as no-op for compatibility
+  const lockWrites = (ms = 0) => { /* local state is master — no lock needed */ };
 
   // Mutations
   const addCase = useCallback(async (form) => {

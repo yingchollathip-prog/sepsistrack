@@ -461,22 +461,35 @@ input,select,textarea,button{font-family:var(--mono);}
 // ── Admin context (simple PIN-based for ER use) ───────────────────────────────
 const ADMIN_PIN = "1234"; // Change in production
 
+// ── Helper: convert a raw Sheets row-object into a full React case object ─────
+const sheetsCaseToLocal = (c) => {
+  const steps = {
+    recognized:   c.SepsisRecognitionTime  || null,
+    ordered:      c.ATBOrderTime            || null,
+    prepared:     c.ATBPreparedTime         || null,
+    administered: c.ATBAdministeredTime     || null,
+  };
+  return { ...c, _steps: steps, _alerts: {} };
+};
+
 export default function App() {
-  const [cases, setCases]             = useState([]);
-  const [auditLog, setAuditLog]       = useState([]);
-  const [loaded, setLoaded]           = useState(false);
-  const [tick, setTick]               = useState(0);
-  const [view, setView]               = useState("board");
-  const [showForm, setShowForm]       = useState(false);
-  const [detailId, setDetailId]       = useState(null);
-  const [alerts, setAlerts]           = useState([]);
-  const [clock, setClock]             = useState("");
-  const [exportToast, setExportToast] = useState(null);
-  const [isAdmin, setIsAdmin]         = useState(false);
-  const [deleteTarget, setDeleteTarget] = useState(null); // case to delete
-  const alertedRef                    = useRef({});
-  const caseCounter                   = useRef(1);
-  const writeLockRef                  = useRef(false); // blocks auto-refresh during/after writes
+  const [cases, setCases]               = useState([]);
+  const [auditLog, setAuditLog]         = useState([]);
+  const [loaded, setLoaded]             = useState(false);
+  const [tick, setTick]                 = useState(0);
+  const [view, setView]                 = useState("board");
+  const [showForm, setShowForm]         = useState(false);
+  const [detailId, setDetailId]         = useState(null);
+  const [alerts, setAlerts]             = useState([]);
+  const [clock, setClock]               = useState("");
+  const [exportToast, setExportToast]   = useState(null);
+  const [isAdmin, setIsAdmin]           = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [saveError, setSaveError]       = useState(null); // error message for failed saves
+  const [savingCaseId, setSavingCaseId] = useState(null); // which case is being saved
+  const alertedRef                      = useRef({});
+  const caseCounter                     = useRef(1);
+  const isSavingRef                     = useRef(false); // true while any write is in flight
 
   // Listen for export completion events
   useEffect(() => {
@@ -488,114 +501,70 @@ export default function App() {
     return () => window.removeEventListener("sepsis_exported", handler);
   }, []);
 
-  const [syncStatus, setSyncStatus] = useState("loading"); // loading | online | offline
+  const [syncStatus, setSyncStatus] = useState("loading");
 
-  // Load from Google Sheets on startup
-  useEffect(() => {
-    setSyncStatus("loading");
-    Promise.all([persist.load(), persist.loadAudit()]).then(([saved, audit]) => {
-      if (saved && saved.length) {
-        const maxId = saved.reduce((mx, c) => {
-          const n = parseInt((c.CaseID || "").replace(/[^0-9]/g,""), 10);
-          return n > mx ? n : mx;
-        }, 0);
-        caseCounter.current = maxId + 1;
-      }
-      setCases(saved || []);
-      setAuditLog(audit || []);
-      setLoaded(true);
+  // ── fetchAndSetCases: fetch Sheets and replace local state ────────────────
+  // This is the ONLY place where setCases is called from Sheets data.
+  const fetchAndSetCases = useCallback(async () => {
+    try {
+      console.log("📡 Fetching cases from Sheets...");
+      const fresh = await sheetsGet("getCases");
+      if (!fresh || !Array.isArray(fresh)) return;
+      const mapped = fresh.map(sheetsCaseToLocal);
+      // Calculate caseCounter from latest data
+      const maxId = mapped.reduce((mx, c) => {
+        const n = parseInt((c.CaseID || "").replace(/[^0-9]/g,""), 10);
+        return n > mx ? n : mx;
+      }, 0);
+      if (maxId >= caseCounter.current) caseCounter.current = maxId + 1;
+      setCases(mapped);
       setSyncStatus("online");
-    }).catch(() => {
-      setLoaded(true);
+      console.log("✅ Fetched", mapped.length, "cases from Sheets");
+      return mapped;
+    } catch(e) {
       setSyncStatus("offline");
-    });
+      console.warn("❌ Fetch failed:", e.message);
+      return null;
+    }
   }, []);
 
-  // ── Sync strategy ────────────────────────────────────────────────────────────
-  // LOCAL STATE IS MASTER. Sheets is a backup and source of NEW cases only.
-  // Rules:
-  //   1. Steps only go forward — never backward under any circumstance
-  //   2. Auto-refresh only ADDS new cases from other devices
-  //   3. For existing cases: only update fields that have MORE data than local
-  //   4. localStorage is kept in sync as offline fallback
+  // Load on startup
+  useEffect(() => {
+    setSyncStatus("loading");
+    fetchAndSetCases().then(data => {
+      if (!data) {
+        // Fallback to localStorage
+        try {
+          const local = localStorage.getItem(STORAGE_KEY);
+          if (local) setCases(JSON.parse(local).map(sheetsCaseToLocal));
+        } catch(_) {}
+      }
+      setLoaded(true);
+    });
+    persist.loadAudit().then(audit => setAuditLog(audit || []));
+  }, []);
 
-  const mergeCase = (local, fromSheets) => {
-    // Pick the highest step timestamp between local and Sheets
-    const best = (a, b) => (a && a !== "" && a !== "null") ? a : (b && b !== "" && b !== "null") ? b : null;
-    const order = best(local.ATBOrderTime,      fromSheets.ATBOrderTime);
-    const prep  = best(local.ATBPreparedTime,   fromSheets.ATBPreparedTime);
-    const admin = best(local.ATBAdministeredTime, fromSheets.ATBAdministeredTime);
-    const comp  = best(local.CompletedTime,     fromSheets.CompletedTime);
-    // Status: only upgrade, never downgrade
-    const statusRank = { active:1, completed:2, DELETED:3 };
-    const localRank  = statusRank[local.Status]  || 0;
-    const sheetsRank = statusRank[fromSheets.Status] || 0;
-    const status = sheetsRank > localRank ? fromSheets.Status : local.Status;
-    const steps = {
-      recognized:   local.SepsisRecognitionTime || fromSheets.SepsisRecognitionTime,
-      ordered:      order,
-      prepared:     prep,
-      administered: admin,
-    };
-    return {
-      ...fromSheets,     // start with Sheets data (has DelayReason etc.)
-      ...local,          // local overrides everything
-      ATBOrderTime:       order,
-      ATBPreparedTime:    prep,
-      ATBAdministeredTime:admin,
-      CompletedTime:      comp,
-      Status:             status,
-      TotalTimeToATBMinutes: admin ? (local.TotalTimeToATBMinutes || fromSheets.TotalTimeToATBMinutes) : null,
-      WithinOneHour:      admin ? (local.WithinOneHour || fromSheets.WithinOneHour) : null,
-      _steps:  steps,
-      _alerts: local._alerts || {},
-    };
-  };
-
+  // Auto-refresh every 15 seconds — ONLY runs when not saving
   useEffect(() => {
     if (!loaded) return;
-    const id = setInterval(async () => {
-      try {
-        const fresh = await sheetsGet("getCases");
-        if (!fresh || !Array.isArray(fresh)) return;
-        setCases(prev => {
-          const prevMap = Object.fromEntries(prev.map(c => [c.CaseID, c]));
-          const result  = [...prev]; // start with ALL local cases
-          // Add new cases from Sheets that don't exist locally
-          fresh.forEach(sheetsCase => {
-            if (!prevMap[sheetsCase.CaseID]) {
-              // Brand new case from another device — add it
-              const steps = {
-                recognized:   sheetsCase.SepsisRecognitionTime || null,
-                ordered:      sheetsCase.ATBOrderTime          || null,
-                prepared:     sheetsCase.ATBPreparedTime       || null,
-                administered: sheetsCase.ATBAdministeredTime   || null,
-              };
-              result.push({ ...sheetsCase, _steps: steps, _alerts: {} });
-              console.log("📥 New case from another device:", sheetsCase.CaseID);
-            } else {
-              // Existing case — merge, never downgrade
-              const idx = result.findIndex(c => c.CaseID === sheetsCase.CaseID);
-              if (idx !== -1) result[idx] = mergeCase(result[idx], sheetsCase);
-            }
-          });
-          return result;
-        });
-        setSyncStatus("online");
-      } catch(e) {
-        setSyncStatus("offline");
-        console.warn("Auto-refresh failed:", e);
+    const id = setInterval(() => {
+      if (isSavingRef.current) {
+        console.log("⏸ Auto-refresh skipped — save in progress");
+        return;
       }
+      fetchAndSetCases();
     }, 15000);
     return () => clearInterval(id);
-  }, [loaded]);
+  }, [loaded, fetchAndSetCases]);
 
-  // Save whenever cases change
+  // Save to localStorage as backup whenever cases change
   useEffect(() => {
-    if (loaded) persist.save(cases);
+    if (loaded) {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(cases)); } catch(_) {}
+    }
   }, [cases, loaded]);
 
-  // Save audit log whenever it changes
+  // Save audit log
   useEffect(() => {
     if (loaded) persist.saveAudit(auditLog);
   }, [auditLog, loaded]);
@@ -645,107 +614,107 @@ export default function App() {
     return (U_ORDER[ua]??9) - (U_ORDER[ub]??9);
   });
 
-  // lockWrites — not needed anymore since auto-refresh never overwrites local
-  // Kept as no-op for compatibility
-  const lockWrites = (ms = 0) => { /* local state is master — no lock needed */ };
+  // ── Mutations — Sheets first, then re-fetch to update UI ────────────────────
 
-  // Mutations
   const addCase = useCallback(async (form) => {
-    const id      = `CASE-${String(caseCounter.current++).padStart(4,"0")}`;
-    const nc      = buildCase(form, id);
-    lockWrites(15000);
-    // Optimistic update — show in UI immediately
-    setCases(prev => [...prev, nc]);
+    const id = `CASE-${String(caseCounter.current++).padStart(4,"0")}`;
+    const nc = buildCase(form, id);
+    isSavingRef.current = true;
+    setSavingCaseId(id);
     setShowForm(false);
-    // Save to Sheets via simple GET params
+    console.log("💾 Saving new case:", id, nc.PatientName);
     try {
-      const params = {
-        action:                "newCase",
-        CaseID:                nc.CaseID,
-        HN:                    nc.HN,
-        PatientName:           nc.PatientName,
-        BedNumber:             nc.BedNumber,
-        ArrivalTime:           nc.ArrivalTime           || "",
+      await sheetsCall({
+        action: "newCase", CaseID: nc.CaseID,
+        HN: nc.HN, PatientName: nc.PatientName, BedNumber: nc.BedNumber,
+        ArrivalTime: nc.ArrivalTime || "",
         SepsisRecognitionTime: nc.SepsisRecognitionTime || "",
-        SuspectedSource:       nc.SuspectedSource       || "",
-        PlannedAntibiotic:     nc.PlannedAntibiotic     || "",
-        OrderingPhysician:     nc.OrderingPhysician     || "",
-        Status:                "active",
-        CreatedBy:             nc.CreatedBy             || "ER Nurse",
-        CreatedAt:             nc.CreatedAt,
-      };
-      await sheetsCall(params);
-      setSyncStatus("online");
-      console.log("✅ Case saved:", nc.CaseID);
+        SuspectedSource: nc.SuspectedSource || "",
+        PlannedAntibiotic: nc.PlannedAntibiotic || "",
+        OrderingPhysician: nc.OrderingPhysician || "",
+        Status: "active", CreatedBy: nc.CreatedBy || "ER Nurse",
+        CreatedAt: nc.CreatedAt,
+      });
+      console.log("✅ newCase saved, re-fetching...");
+      await fetchAndSetCases();
     } catch(e) {
       setSyncStatus("offline");
-      console.error("❌ Save failed:", e.message);
+      setSaveError("Failed to register patient. Please try again.");
+      console.error("❌ newCase failed:", e.message);
+      setTimeout(() => setSaveError(null), 5000);
+    } finally {
+      isSavingRef.current = false;
+      setSavingCaseId(null);
     }
-  }, []);
+  }, [fetchAndSetCases]);
 
   const advanceStep = useCallback(async (caseId) => {
+    // Determine which step to advance from current local state
+    const c = cases.find(x => x.CaseID === caseId);
+    if (!c) return;
+
+    const alreadyOrdered      = !!(c.ATBOrderTime      || c._steps?.ordered);
+    const alreadyPrepared     = !!(c.ATBPreparedTime   || c._steps?.prepared);
+    const alreadyAdministered = !!(c.ATBAdministeredTime || c._steps?.administered);
+
     let stepName = null;
-    let stepTs   = null;
-    lockWrites(15000);
+    if (!alreadyOrdered)      stepName = "ordered";
+    else if (!alreadyPrepared)     stepName = "prepared";
+    else if (!alreadyAdministered) stepName = "administered";
+    else { console.log("⚠️ All steps done for", caseId); return; }
 
-    setCases(prev => prev.map(c => {
-      if (c.CaseID !== caseId) return c;
-      const ts      = nowISO();
-      const updated = { ...c, UpdatedAt: ts };
+    const stepTs = nowISO();
+    console.log("💾 Advancing step:", caseId, stepName, stepTs);
 
-      // Use flat fields as source of truth — never go back
-      const alreadyOrdered      = !!(c.ATBOrderTime      || c._steps?.ordered);
-      const alreadyPrepared     = !!(c.ATBPreparedTime   || c._steps?.prepared);
-      const alreadyAdministered = !!(c.ATBAdministeredTime || c._steps?.administered);
+    isSavingRef.current = true;
+    setSavingCaseId(caseId);
+    setSaveError(null);
 
-      if (!alreadyOrdered) {
-        stepName = "ordered"; stepTs = ts;
-        updated.ATBOrderTime = ts;
-        updated._steps = { recognized: c.SepsisRecognitionTime, ordered: ts, prepared: null, administered: null };
-
-      } else if (!alreadyPrepared) {
-        stepName = "prepared"; stepTs = ts;
-        updated.ATBPreparedTime = ts;
-        updated._steps = { recognized: c.SepsisRecognitionTime, ordered: c.ATBOrderTime||c._steps?.ordered, prepared: ts, administered: null };
-
-      } else if (!alreadyAdministered) {
-        stepName = "administered"; stepTs = ts;
-        updated.ATBAdministeredTime = ts;
-        updated.CompletedTime       = ts;
-        updated.Status              = "completed";
-        const total = diffMin(updated.SepsisRecognitionTime, ts);
-        updated.TotalTimeToATBMinutes = total ? +total.toFixed(1) : null;
-        updated.WithinOneHour         = total !== null ? (total <= 60 ? "Yes" : "No") : null;
-        updated._steps = {
-          recognized:   c.SepsisRecognitionTime,
-          ordered:      c.ATBOrderTime      || c._steps?.ordered,
-          prepared:     c.ATBPreparedTime   || c._steps?.prepared,
-          administered: ts,
-        };
-      } else {
-        // All steps already done — do nothing
-        console.log("⚠️ All steps already completed for", caseId);
+    // Optimistic update so UI feels instant
+    setCases(prev => prev.map(x => {
+      if (x.CaseID !== caseId) return x;
+      const u = { ...x, UpdatedAt: stepTs };
+      if (stepName === "ordered") {
+        u.ATBOrderTime = stepTs;
+        u._steps = { ...x._steps, ordered: stepTs };
+      } else if (stepName === "prepared") {
+        u.ATBPreparedTime = stepTs;
+        u._steps = { ...x._steps, prepared: stepTs };
+      } else if (stepName === "administered") {
+        u.ATBAdministeredTime = stepTs;
+        u.CompletedTime = stepTs;
+        u.Status = "completed";
+        const total = diffMin(u.SepsisRecognitionTime, stepTs);
+        u.TotalTimeToATBMinutes = total ? +total.toFixed(1) : null;
+        u.WithinOneHour = total !== null ? (total <= 60 ? "Yes" : "No") : null;
+        u._steps = { ...x._steps, administered: stepTs };
       }
-      return updated;
+      return u;
     }));
 
-    if (stepName) {
-      try {
-        await sheetsCall({ action: "updateStep", CaseID: caseId, step: stepName, ts: stepTs });
-        setSyncStatus("online");
-        console.log("✅ Step saved:", caseId, stepName, stepTs);
-      } catch(e) {
-        setSyncStatus("offline");
-        console.error("❌ Step save failed:", e.message);
-      }
+    try {
+      console.log("📤 Calling updateStep:", { CaseID: caseId, step: stepName, ts: stepTs });
+      const result = await sheetsCall({ action: "updateStep", CaseID: caseId, step: stepName, ts: stepTs });
+      console.log("✅ updateStep response:", JSON.stringify(result));
+      // Re-fetch to confirm what Sheets actually saved
+      console.log("📡 Re-fetching after step save...");
+      await fetchAndSetCases();
+    } catch(e) {
+      // Revert optimistic update on failure
+      setSaveError("Failed to save step to Google Sheets. Please try again.");
+      console.error("❌ updateStep failed:", e.message);
+      setTimeout(() => setSaveError(null), 6000);
+      await fetchAndSetCases(); // re-fetch to show true state
+    } finally {
+      isSavingRef.current = false;
+      setSavingCaseId(null);
     }
-  }, []);
+  }, [cases, fetchAndSetCases]);
 
   const updateDelay = useCallback(async (caseId, reason, detail) => {
-    const ts = nowISO();
-    lockWrites(10000);
+    isSavingRef.current = true;
     setCases(prev => prev.map(c =>
-      c.CaseID !== caseId ? c : { ...c, DelayReason: reason, OtherDelayReasonDetail: detail||"", UpdatedAt: ts }
+      c.CaseID !== caseId ? c : { ...c, DelayReason: reason, OtherDelayReasonDetail: detail||"" }
     ));
     try {
       await sheetsCall({ action: "setDelay", CaseID: caseId,
@@ -753,6 +722,8 @@ export default function App() {
       setSyncStatus("online");
     } catch(e) {
       console.error("❌ setDelay failed:", e.message);
+    } finally {
+      isSavingRef.current = false;
     }
   }, []);
 
@@ -868,6 +839,31 @@ export default function App() {
           {view==="report"   && <ReportView   cases={[...activeCases,...completedCases]} completed={completedCases} withinHour={withinHour} avgMin={avgMin} compliance={compliance} exportCSV={exportCSV} exportXLSX={exportXLSX} isAdmin={isAdmin} />}
           {view==="audit"    && <AuditView    log={auditLog} deletedCases={cases.filter(c=>c.IsDeleted)} exportCSV={exportCSV} exportXLSX={exportXLSX} />}
         </main>
+
+        {/* Save error banner */}
+        {saveError && (
+          <div style={{
+            position:"fixed", top:64, left:"50%", transform:"translateX(-50%)",
+            background:"#b71c1c", color:"#fff", padding:"10px 20px",
+            borderRadius:8, zIndex:400, fontSize:".8rem", fontWeight:700,
+            boxShadow:"0 4px 20px rgba(0,0,0,.5)", display:"flex", gap:10, alignItems:"center"
+          }}>
+            ❌ {saveError}
+            <button onClick={() => setSaveError(null)} style={{background:"none",border:"none",color:"#fff",cursor:"pointer",fontSize:"1rem"}}>×</button>
+          </div>
+        )}
+
+        {/* Saving indicator */}
+        {savingCaseId && (
+          <div style={{
+            position:"fixed", bottom:80, left:16, zIndex:400,
+            background:"var(--panel)", border:"1px solid var(--accent)",
+            borderRadius:8, padding:"8px 14px", fontSize:".72rem", color:"var(--accent)",
+            display:"flex", alignItems:"center", gap:8
+          }}>
+            <span style={{animation:"blink 1s infinite"}}>⟳</span> Saving to Google Sheets…
+          </div>
+        )}
 
         {/* Alert toasts */}
         <div className="atoasts">
@@ -1002,14 +998,14 @@ function PatientsView({ cases, tick, onAdd, onAdvance, onUpdateDelay, onDetail, 
         <div className="empty"><div className="eicon">🏥</div><div>No active patients.</div></div>
       ) : (
         <div className="pgrid">
-          {cases.map(c => <PatientCard key={c.CaseID} c={c} tick={tick} onAdvance={onAdvance} onUpdateDelay={onUpdateDelay} onDetail={onDetail} isAdmin={isAdmin} onDelete={onDelete} />)}
+          {cases.map(c => <PatientCard key={c.CaseID} c={c} tick={tick} onAdvance={onAdvance} onUpdateDelay={onUpdateDelay} onDetail={onDetail} isAdmin={isAdmin} onDelete={onDelete} isSaving={savingCaseId===c.CaseID} />)}
         </div>
       )}
     </div>
   );
 }
 
-function PatientCard({ c, tick, onAdvance, onUpdateDelay, onDetail, isAdmin, onDelete }) {
+function PatientCard({ c, tick, onAdvance, onUpdateDelay, onDetail, isAdmin, onDelete, isSaving }) {
   const el           = elapsedSec(c.SepsisRecognitionTime);
   // Consider "done" if Status=completed OR if ATBAdministeredTime is set
   const administered = !!(c._steps?.administered || c.ATBAdministeredTime);
@@ -1083,7 +1079,16 @@ function PatientCard({ c, tick, onAdvance, onUpdateDelay, onDetail, isAdmin, onD
       {c.DelayReason && <div className="dreason">⚠ Delay: {c.DelayReason}{c.OtherDelayReasonDetail?" — "+c.OtherDelayReasonDetail:""}</div>}
 
       <div className="cactions">
-        {canAdvance && <button className="btn btn-p" onClick={() => onAdvance(c.CaseID)}>{nextStep.icon} {nextStep.label}</button>}
+        {canAdvance && (
+        <button
+          className="btn btn-p"
+          onClick={() => onAdvance(c.CaseID)}
+          disabled={isSaving}
+          style={isSaving ? {opacity:.6, cursor:"not-allowed"} : {}}
+        >
+          {isSaving ? "⟳ Saving…" : `${nextStep.icon} ${nextStep.label}`}
+        </button>
+      )}
         <button className="btn btn-g" onClick={() => onDetail(c.CaseID)}>🔍</button>
         {isAdmin && <button className="btn btn-g" style={{color:"var(--red)",borderColor:"rgba(245,0,87,.4)",flex:"0 0 auto"}} onClick={() => onDelete(c)}>🗑</button>}
       </div>

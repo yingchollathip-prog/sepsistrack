@@ -595,10 +595,31 @@ export default function App() {
     return (U_ORDER[ua]??9) - (U_ORDER[ub]??9);
   });
 
-  // Helper: lock writes for N ms to prevent auto-refresh overwriting optimistic UI
-  const lockWrites = (ms = 12000) => {
+  // Helper: lock writes for N ms, then do one immediate refresh to confirm Sheets saved
+  const lockWrites = (ms = 15000) => {
     writeLockRef.current = true;
-    setTimeout(() => { writeLockRef.current = false; }, ms);
+    setTimeout(() => {
+      writeLockRef.current = false;
+      // Trigger one immediate refresh after lock releases
+      sheetsGet("getCases").then(fresh => {
+        if (fresh && Array.isArray(fresh)) {
+          setCases(prev => {
+            const prevMap = Object.fromEntries(prev.map(c => [c.CaseID, c]));
+            return fresh.map(c => ({
+              ...c,
+              _steps: {
+                recognized:   c.SepsisRecognitionTime  || null,
+                ordered:      c.ATBOrderTime            || null,
+                prepared:     c.ATBPreparedTime         || null,
+                administered: c.ATBAdministeredTime     || null,
+              },
+              _alerts: prevMap[c.CaseID]?._alerts || {},
+            }));
+          });
+          setSyncStatus("online");
+        }
+      }).catch(() => setSyncStatus("offline"));
+    }, ms);
   };
 
   // Mutations
@@ -622,19 +643,27 @@ export default function App() {
   }, []);
 
   const advanceStep = useCallback(async (caseId) => {
-    let updatedCase = null;
-    lockWrites(12000);
+    let delta = null;      // only the fields that changed
+    let fullCase = null;   // full local case for UI
+    lockWrites(15000);
+
     // Optimistic update — change UI immediately
     setCases(prev => prev.map(c => {
       if (c.CaseID !== caseId) return c;
       const ts = nowISO();
       const updated = { ...c, UpdatedAt: ts };
+
       if (!updated.ATBOrderTime) {
         updated.ATBOrderTime = ts;
         updated._steps = { ...c._steps, recognized: c.SepsisRecognitionTime, ordered: ts };
+        // Send ONLY the new field — never send null timestamps
+        delta = { CaseID: c.CaseID, ATBOrderTime: ts, UpdatedAt: ts };
+
       } else if (!updated.ATBPreparedTime) {
         updated.ATBPreparedTime = ts;
         updated._steps = { ...c._steps, prepared: ts };
+        delta = { CaseID: c.CaseID, ATBPreparedTime: ts, UpdatedAt: ts };
+
       } else if (!updated.ATBAdministeredTime) {
         updated.ATBAdministeredTime = ts;
         updated.CompletedTime       = ts;
@@ -648,18 +677,30 @@ export default function App() {
           prepared:     c.ATBPreparedTime,
           administered: ts,
         };
+        delta = {
+          CaseID:               c.CaseID,
+          ATBAdministeredTime:  ts,
+          CompletedTime:        ts,
+          Status:               "completed",
+          TotalTimeToATBMinutes: updated.TotalTimeToATBMinutes,
+          WithinOneHour:        updated.WithinOneHour,
+          UpdatedAt:            ts,
+        };
       }
-      updatedCase = updated;
+
+      fullCase = updated;
       return updated;
     }));
-    // Persist to Google Sheets — send full case so all columns update correctly
-    if (updatedCase) {
+
+    // Persist ONLY the delta to Google Sheets — no null timestamps
+    if (delta) {
       try {
-        await sheetsPost({ action: "updateCase", case: updatedCase });
+        await sheetsPost({ action: "updateCase", case: delta });
         setSyncStatus("online");
+        console.log("✅ Step saved to Sheets:", JSON.stringify(delta));
       } catch(e) {
         setSyncStatus("offline");
-        console.error("Failed to sync step to Sheets:", e);
+        console.error("❌ Failed to sync step to Sheets:", e);
       }
     }
   }, []);
@@ -998,7 +1039,7 @@ function PatientCard({ c, tick, onAdvance, onUpdateDelay, onDetail, isAdmin, onD
       {c.DelayReason && <div className="dreason">⚠ Delay: {c.DelayReason}{c.OtherDelayReasonDetail?" — "+c.OtherDelayReasonDetail:""}</div>}
 
       <div className="cactions">
-        {nextStep && <button className="btn btn-p" onClick={() => onAdvance(c.CaseID)}>{nextStep.icon} {nextStep.label}</button>}
+        {nextStep && !administered && <button className="btn btn-p" onClick={() => onAdvance(c.CaseID)}>{nextStep.icon} {nextStep.label}</button>}
         <button className="btn btn-g" onClick={() => onDetail(c.CaseID)}>🔍</button>
         {isAdmin && <button className="btn btn-g" style={{color:"var(--red)",borderColor:"rgba(245,0,87,.4)",flex:"0 0 auto"}} onClick={() => onDelete(c)}>🗑</button>}
       </div>

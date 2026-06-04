@@ -11,31 +11,27 @@ const SHEETS_URL = "https://script.google.com/macros/s/AKfycbx2pTp_HDxIAoEC-fm7Q
 const API_KEY    = "SepsisTrack-ER-2026";
 
 // ─── Sheets communication ─────────────────────────────────────────────────────
-// IMPORTANT: Apps Script POST is unreliable from browsers — the redirect
-// causes the request body to be dropped silently. We encode ALL requests
-// (reads AND writes) as GET with a base64-encoded payload parameter.
-// The Apps Script doGet() decodes and routes them.
+// ALL requests are simple GET with URL query parameters.
+// No POST, no body, no encoding. 100% reliable with Apps Script.
 
 const sheetsCall = async (params) => {
-  const payload = btoa(unescape(encodeURIComponent(
-    JSON.stringify({ ...params, apiKey: API_KEY })
-  )));
-  const url = `${SHEETS_URL}?payload=${encodeURIComponent(payload)}`;
-  const res  = await fetch(url, { redirect: "follow" });
+  const qs  = Object.entries({ ...params, apiKey: API_KEY })
+    .filter(([, v]) => v !== null && v !== undefined)
+    .map(([k, v]) => encodeURIComponent(k) + "=" + encodeURIComponent(String(v)))
+    .join("&");
+  const url = SHEETS_URL + "?" + qs;
+  const res  = await fetch(url);
   const text = await res.text();
   try {
     const json = JSON.parse(text);
     if (json && json.ok === false) throw new Error(json.error || "Sheets error");
     return json?.data ?? json;
   } catch(e) {
-    if (text.includes('"ok":true')) return true; // parse edge case
-    throw new Error("Sheets response parse error: " + text.slice(0, 100));
+    throw new Error("Sheets parse error: " + text.slice(0, 200));
   }
 };
 
-// Convenience wrappers
-const sheetsGet  = (action)      => sheetsCall({ action });
-const sheetsPost = (body)        => sheetsCall(body);
+const sheetsGet  = (action, extra = {}) => sheetsCall({ action, ...extra });
 
 const SOURCES = ["Pneumonia","UTI / Urinary","Abdominal / GI","Skin / Soft Tissue",
   "Bacteremia / Unknown","CNS / Meningitis","Endocarditis","Bone / Joint","Other"];
@@ -625,50 +621,64 @@ export default function App() {
   // Mutations
   const addCase = useCallback(async (form) => {
     const id      = `CASE-${String(caseCounter.current++).padStart(4,"0")}`;
-    const newCase = buildCase(form, id);
-    // 1. Lock auto-refresh for 12 seconds
-    lockWrites(12000);
-    // 2. Optimistic update — add to UI immediately
-    setCases(prev => [...prev, newCase]);
+    const nc      = buildCase(form, id);
+    lockWrites(15000);
+    // Optimistic update — show in UI immediately
+    setCases(prev => [...prev, nc]);
     setShowForm(false);
-    // 3. Persist to Google Sheets
+    // Save to Sheets via simple GET params
     try {
-      await sheetsPost({ action: "appendCase", case: newCase });
+      const params = {
+        action:                "newCase",
+        CaseID:                nc.CaseID,
+        HN:                    nc.HN,
+        PatientName:           nc.PatientName,
+        BedNumber:             nc.BedNumber,
+        ArrivalTime:           nc.ArrivalTime           || "",
+        SepsisRecognitionTime: nc.SepsisRecognitionTime || "",
+        SuspectedSource:       nc.SuspectedSource       || "",
+        PlannedAntibiotic:     nc.PlannedAntibiotic     || "",
+        OrderingPhysician:     nc.OrderingPhysician     || "",
+        Status:                "active",
+        CreatedBy:             nc.CreatedBy             || "ER Nurse",
+        CreatedAt:             nc.CreatedAt,
+      };
+      await sheetsCall(params);
       setSyncStatus("online");
-      console.log("Case saved to Sheets:", newCase.CaseID);
+      console.log("✅ Case saved:", nc.CaseID);
     } catch(e) {
       setSyncStatus("offline");
-      console.error("Failed to save case to Sheets:", e);
+      console.error("❌ Save failed:", e.message);
     }
   }, []);
 
   const advanceStep = useCallback(async (caseId) => {
-    let delta = null;      // only the fields that changed
-    let fullCase = null;   // full local case for UI
+    let stepName = null;
+    let stepTs   = null;
     lockWrites(15000);
 
     // Optimistic update — change UI immediately
     setCases(prev => prev.map(c => {
       if (c.CaseID !== caseId) return c;
-      const ts = nowISO();
+      const ts      = nowISO();
       const updated = { ...c, UpdatedAt: ts };
 
       if (!updated.ATBOrderTime) {
+        stepName = "ordered"; stepTs = ts;
         updated.ATBOrderTime = ts;
         updated._steps = { ...c._steps, recognized: c.SepsisRecognitionTime, ordered: ts };
-        // Send ONLY the new field — never send null timestamps
-        delta = { CaseID: c.CaseID, ATBOrderTime: ts, UpdatedAt: ts };
 
       } else if (!updated.ATBPreparedTime) {
+        stepName = "prepared"; stepTs = ts;
         updated.ATBPreparedTime = ts;
         updated._steps = { ...c._steps, prepared: ts };
-        delta = { CaseID: c.CaseID, ATBPreparedTime: ts, UpdatedAt: ts };
 
       } else if (!updated.ATBAdministeredTime) {
+        stepName = "administered"; stepTs = ts;
         updated.ATBAdministeredTime = ts;
         updated.CompletedTime       = ts;
         updated.Status              = "completed";
-        const total                 = diffMin(updated.SepsisRecognitionTime, ts);
+        const total = diffMin(updated.SepsisRecognitionTime, ts);
         updated.TotalTimeToATBMinutes = total ? +total.toFixed(1) : null;
         updated.WithinOneHour         = total !== null ? (total <= 60 ? "Yes" : "No") : null;
         updated._steps = {
@@ -677,49 +687,35 @@ export default function App() {
           prepared:     c.ATBPreparedTime,
           administered: ts,
         };
-        delta = {
-          CaseID:               c.CaseID,
-          ATBAdministeredTime:  ts,
-          CompletedTime:        ts,
-          Status:               "completed",
-          TotalTimeToATBMinutes: updated.TotalTimeToATBMinutes,
-          WithinOneHour:        updated.WithinOneHour,
-          UpdatedAt:            ts,
-        };
       }
-
-      fullCase = updated;
       return updated;
     }));
 
-    // Persist ONLY the delta to Google Sheets — no null timestamps
-    if (delta) {
+    // Save step to Sheets — simple GET params, no body
+    if (stepName) {
       try {
-        await sheetsPost({ action: "updateCase", case: delta });
+        await sheetsCall({ action: "updateStep", CaseID: caseId, step: stepName, ts: stepTs });
         setSyncStatus("online");
-        console.log("✅ Step saved to Sheets:", JSON.stringify(delta));
+        console.log("✅ Step saved:", caseId, stepName, stepTs);
       } catch(e) {
         setSyncStatus("offline");
-        console.error("❌ Failed to sync step to Sheets:", e);
+        console.error("❌ Step save failed:", e.message);
       }
     }
   }, []);
 
   const updateDelay = useCallback(async (caseId, reason, detail) => {
     const ts = nowISO();
-    let updatedCase = null;
-    lockWrites(12000);
-    setCases(prev => prev.map(c => {
-      if (c.CaseID !== caseId) return c;
-      updatedCase = { ...c, DelayReason: reason, OtherDelayReasonDetail: detail||"", UpdatedAt: ts };
-      return updatedCase;
-    }));
-    if (updatedCase) {
-      try {
-        await sheetsPost({ action: "updateCase", case: { CaseID: caseId, DelayReason: reason, OtherDelayReasonDetail: detail||"", UpdatedAt: ts } });
-      } catch(e) {
-        console.error("Failed to sync delay reason to Sheets:", e);
-      }
+    lockWrites(10000);
+    setCases(prev => prev.map(c =>
+      c.CaseID !== caseId ? c : { ...c, DelayReason: reason, OtherDelayReasonDetail: detail||"", UpdatedAt: ts }
+    ));
+    try {
+      await sheetsCall({ action: "setDelay", CaseID: caseId,
+        DelayReason: reason, OtherDelayReasonDetail: detail||"" });
+      setSyncStatus("online");
+    } catch(e) {
+      console.error("❌ setDelay failed:", e.message);
     }
   }, []);
 
@@ -746,15 +742,16 @@ export default function App() {
       setAuditLog(prev => [...prev, entry]);
       // Persist to Google Sheets
       try {
-        await sheetsPost({
-          action: "softDelete",
+        await sheetsCall({
+          action: "deleteCase",
           CaseID: caseId, HN: c.HN, BedNumber: c.BedNumber,
           PatientName: c.PatientName, PreviousStatus: c.Status,
           DeletedBy: deletedBy, DeleteReason: reason,
           DeleteReasonDetail: otherDetail||"",
         });
+        setSyncStatus("online");
       } catch(e) {
-        console.error("Failed to sync soft-delete to Sheets:", e);
+        console.error("❌ deleteCase failed:", e.message);
       }
     }
     setDeleteTarget(null);

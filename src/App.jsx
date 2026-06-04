@@ -10,41 +10,32 @@ const AUDIT_KEY    = "sepsis_audit_v4";
 const SHEETS_URL = "https://script.google.com/macros/s/AKfycbx2pTp_HDxIAoEC-fm7QrrwVnuwfJu9A08eenPudasFd3vnG_nwTqxHOn65BUt8INSlfQ/exec";
 const API_KEY    = "SepsisTrack-ER-2026";
 
-// Helper: GET request to Sheets backend
-const sheetsGet = async (action) => {
-  const url = `${SHEETS_URL}?action=${action}&apiKey=${API_KEY}`;
-  const res  = await fetch(url, { redirect: "follow" });
-  const json = await res.json();
-  if (!json.ok) throw new Error(json.error || "Sheets GET failed");
-  return json.data;
-};
+// ─── Sheets communication ─────────────────────────────────────────────────────
+// IMPORTANT: Apps Script POST is unreliable from browsers — the redirect
+// causes the request body to be dropped silently. We encode ALL requests
+// (reads AND writes) as GET with a base64-encoded payload parameter.
+// The Apps Script doGet() decodes and routes them.
 
-// Helper: POST request to Sheets backend
-// Apps Script requires no custom Content-Type header to avoid CORS preflight.
-// We send as plain text body — Apps Script reads e.postData.contents fine.
-const sheetsPost = async (body) => {
-  const payload = JSON.stringify({ ...body, apiKey: API_KEY });
+const sheetsCall = async (params) => {
+  const payload = btoa(unescape(encodeURIComponent(
+    JSON.stringify({ ...params, apiKey: API_KEY })
+  )));
+  const url = `${SHEETS_URL}?payload=${encodeURIComponent(payload)}`;
+  const res  = await fetch(url, { redirect: "follow" });
+  const text = await res.text();
   try {
-    const res = await fetch(SHEETS_URL, {
-      method:  "POST",
-      redirect: "follow",
-      body:    payload,
-    });
-    // Apps Script POST responses after redirect may not be readable in some
-    // browsers — that is OK. If we get here without throwing, it succeeded.
-    try {
-      const json = await res.json();
-      if (json && !json.ok) console.warn("Sheets POST warning:", json.error);
-      return json?.data;
-    } catch(_) {
-      // Response not JSON-parseable after redirect — still counts as success
-      return true;
-    }
+    const json = JSON.parse(text);
+    if (json && json.ok === false) throw new Error(json.error || "Sheets error");
+    return json?.data ?? json;
   } catch(e) {
-    console.error("sheetsPost error:", e);
-    throw e;
+    if (text.includes('"ok":true')) return true; // parse edge case
+    throw new Error("Sheets response parse error: " + text.slice(0, 100));
   }
 };
+
+// Convenience wrappers
+const sheetsGet  = (action)      => sheetsCall({ action });
+const sheetsPost = (body)        => sheetsCall(body);
 
 const SOURCES = ["Pneumonia","UTI / Urinary","Abdominal / GI","Skin / Soft Tissue",
   "Bacteremia / Unknown","CNS / Meningitis","Endocarditis","Bone / Joint","Other"];

@@ -504,14 +504,13 @@ export default function App() {
   const [syncStatus, setSyncStatus] = useState("loading");
 
   // ── fetchAndSetCases: fetch Sheets and replace local state ────────────────
-  // This is the ONLY place where setCases is called from Sheets data.
   const fetchAndSetCases = useCallback(async () => {
     try {
       console.log("📡 Fetching cases from Sheets...");
       const fresh = await sheetsGet("getCases");
       if (!fresh || !Array.isArray(fresh)) return;
       const mapped = fresh.map(sheetsCaseToLocal);
-      // Calculate caseCounter from latest data
+      // Update counter from fetched cases
       const maxId = mapped.reduce((mx, c) => {
         const n = parseInt((c.CaseID || "").replace(/[^0-9]/g,""), 10);
         return n > mx ? n : mx;
@@ -519,7 +518,7 @@ export default function App() {
       if (maxId >= caseCounter.current) caseCounter.current = maxId + 1;
       setCases(mapped);
       setSyncStatus("online");
-      console.log("✅ Fetched", mapped.length, "cases from Sheets");
+      console.log("✅ Fetched", mapped.length, "cases, next CaseID counter:", caseCounter.current);
       return mapped;
     } catch(e) {
       setSyncStatus("offline");
@@ -528,15 +527,34 @@ export default function App() {
     }
   }, []);
 
-  // Load on startup
+  // Load on startup — also fetch maxCaseId including deleted cases
   useEffect(() => {
     setSyncStatus("loading");
+    // First get the max CaseID from ALL cases (including deleted)
+    // so counter never resets after deletion
+    sheetsGet("getMaxCaseId").then(result => {
+      if (result && result.maxId) {
+        const n = parseInt(String(result.maxId).replace(/[^0-9]/g,""), 10);
+        if (n >= caseCounter.current) {
+          caseCounter.current = n + 1;
+          console.log("📊 Restored caseCounter to:", caseCounter.current);
+        }
+      }
+    }).catch(() => {}); // non-critical — falls back to getCases counter
+
     fetchAndSetCases().then(data => {
       if (!data) {
-        // Fallback to localStorage
         try {
           const local = localStorage.getItem(STORAGE_KEY);
-          if (local) setCases(JSON.parse(local).map(sheetsCaseToLocal));
+          if (local) {
+            const parsed = JSON.parse(local).map(sheetsCaseToLocal);
+            const maxLocal = parsed.reduce((mx, c) => {
+              const n = parseInt((c.CaseID||"").replace(/[^0-9]/g,""),10);
+              return n>mx?n:mx;
+            }, 0);
+            if (maxLocal >= caseCounter.current) caseCounter.current = maxLocal + 1;
+            setCases(parsed);
+          }
         } catch(_) {}
       }
       setLoaded(true);
@@ -617,7 +635,10 @@ export default function App() {
   // ── Mutations — Sheets first, then re-fetch to update UI ────────────────────
 
   const addCase = useCallback(async (form) => {
-    const id = `CASE-${String(caseCounter.current++).padStart(4,"0")}`;
+    // Use timestamp suffix to guarantee uniqueness even if counter resets
+    const num = caseCounter.current++;
+    const ts  = Date.now().toString().slice(-4); // last 4 digits of timestamp
+    const id  = `CASE-${String(num).padStart(4,"0")}-${ts}`;
     const nc = buildCase(form, id);
 
     console.log("💾 Saving new case:", id, nc.PatientName, nc.HN, nc.BedNumber);

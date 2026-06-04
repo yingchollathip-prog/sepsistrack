@@ -459,7 +459,7 @@ input,select,textarea,button{font-family:var(--mono);}
 // App
 // ═══════════════════════════════════════════════════════════════════════════════
 // ── Admin context (simple PIN-based for ER use) ───────────────────────────────
-const ADMIN_PIN = "1234"; // Change in production
+const ADMIN_PIN = "1669";
 
 // ── Helper: convert a raw Sheets row-object into a full React case object ─────
 const sheetsCaseToLocal = (c) => {
@@ -727,43 +727,60 @@ export default function App() {
     }
   }, []);
 
-  // Soft-delete: marks IsDeleted=true, appends audit entry
+  // Soft-delete: save to Sheets first, then re-fetch — same pattern as advanceStep
   const softDelete = useCallback(async (caseId, reason, otherDetail, deletedBy) => {
+    const c = cases.find(x => x.CaseID === caseId);
+    if (!c) { setDeleteTarget(null); return; }
+
     const ts = nowISO();
-    const c  = cases.find(x => x.CaseID === caseId);
-    lockWrites(12000);
-    // Optimistic UI update
-    setCases(prev => prev.map(x => {
-      if (x.CaseID !== caseId) return x;
-      return { ...x, IsDeleted: true, DeletedAt: ts, DeletedBy: deletedBy,
-               DeleteReason: reason, DeleteReasonDetail: otherDetail||"", UpdatedAt: ts };
-    }));
-    if (c) {
-      const entry = {
-        AuditID: `AUDIT-${Date.now()}`,
-        CaseID: c.CaseID, HN: c.HN, BedNumber: c.BedNumber,
-        PatientName: c.PatientName, DeletedBy: deletedBy,
-        DeletedAt: ts, DeleteReason: reason,
-        DeleteReasonDetail: otherDetail||"",
-        ActionType: "SOFT_DELETE",
-      };
-      setAuditLog(prev => [...prev, entry]);
-      // Persist to Google Sheets
-      try {
-        await sheetsCall({
-          action: "deleteCase",
-          CaseID: caseId, HN: c.HN, BedNumber: c.BedNumber,
-          PatientName: c.PatientName, PreviousStatus: c.Status,
-          DeletedBy: deletedBy, DeleteReason: reason,
-          DeleteReasonDetail: otherDetail||"",
-        });
-        setSyncStatus("online");
-      } catch(e) {
-        console.error("❌ deleteCase failed:", e.message);
-      }
-    }
+    isSavingRef.current = true;
+    setSavingCaseId(caseId);
     setDeleteTarget(null);
-  }, [cases]);
+
+    // Optimistic UI — hide case immediately so it feels instant
+    setCases(prev => prev.map(x =>
+      x.CaseID !== caseId ? x
+      : { ...x, IsDeleted: true, DeletedAt: ts, DeletedBy: deletedBy,
+          DeleteReason: reason, DeleteReasonDetail: otherDetail||"", UpdatedAt: ts }
+    ));
+
+    // Write audit entry locally
+    const entry = {
+      AuditID: `AUDIT-${Date.now()}`,
+      CaseID: c.CaseID, HN: c.HN, BedNumber: c.BedNumber,
+      PatientName: c.PatientName, DeletedBy: deletedBy,
+      DeletedAt: ts, DeleteReason: reason,
+      DeleteReasonDetail: otherDetail||"",
+      ActionType: "SOFT_DELETE",
+    };
+    setAuditLog(prev => [...prev, entry]);
+
+    // Save to Sheets
+    try {
+      console.log("💾 Deleting case:", caseId, "reason:", reason);
+      await sheetsCall({
+        action: "deleteCase",
+        CaseID: caseId, HN: c.HN, BedNumber: c.BedNumber,
+        PatientName: c.PatientName, PreviousStatus: c.Status,
+        DeletedBy: deletedBy, DeleteReason: reason,
+        DeleteReasonDetail: otherDetail||"",
+      });
+      console.log("✅ Case deleted from Sheets:", caseId);
+      // Re-fetch to confirm deletion is reflected in Sheets
+      await fetchAndSetCases();
+    } catch(e) {
+      setSaveError("Failed to delete case. Please try again.");
+      console.error("❌ deleteCase failed:", e.message);
+      // Revert optimistic update
+      setCases(prev => prev.map(x =>
+        x.CaseID !== caseId ? x : { ...x, IsDeleted: false, DeletedAt: null, DeletedBy: null }
+      ));
+      setTimeout(() => setSaveError(null), 5000);
+    } finally {
+      isSavingRef.current = false;
+      setSavingCaseId(null);
+    }
+  }, [cases, fetchAndSetCases]);
 
   const detailCase = detailId ? cases.find(c => c.CaseID === detailId) : null;
 

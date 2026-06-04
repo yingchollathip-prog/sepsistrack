@@ -610,8 +610,8 @@ export default function App() {
           {view==="board"    && <BoardView    cases={sortedActive} completed={completedCases} tick={tick} onAdd={() => setShowForm(true)} onDetail={setDetailId} isAdmin={isAdmin} onDelete={setDeleteTarget} />}
           {view==="patients" && <PatientsView cases={sortedActive} tick={tick} onAdd={() => setShowForm(true)} onAdvance={advanceStep} onUpdateDelay={updateDelay} onDetail={setDetailId} isAdmin={isAdmin} onDelete={setDeleteTarget} />}
           {view==="history"  && <HistoryView  cases={completedCases} onDetail={setDetailId} exportCSV={exportCSV} exportXLSX={exportXLSX} isAdmin={isAdmin} onDelete={setDeleteTarget} />}
-          {view==="monthly"  && <MonthlyView  cases={completedCases} exportCSV={exportCSV} exportXLSX={exportXLSX} />}
-          {view==="report"   && <ReportView   cases={[...activeCases,...completedCases]} completed={completedCases} withinHour={withinHour} avgMin={avgMin} compliance={compliance} exportCSV={exportCSV} exportXLSX={exportXLSX} />}
+          {view==="monthly"  && <MonthlyView  cases={completedCases} exportCSV={exportCSV} exportXLSX={exportXLSX} isAdmin={isAdmin} />}
+          {view==="report"   && <ReportView   cases={[...activeCases,...completedCases]} completed={completedCases} withinHour={withinHour} avgMin={avgMin} compliance={compliance} exportCSV={exportCSV} exportXLSX={exportXLSX} isAdmin={isAdmin} />}
           {view==="audit"    && <AuditView    log={auditLog} deletedCases={cases.filter(c=>c.IsDeleted)} exportCSV={exportCSV} exportXLSX={exportXLSX} />}
         </main>
 
@@ -627,14 +627,16 @@ export default function App() {
         </div>
 
         {/* Export this month - floating */}
-        <div style={{position:"fixed",bottom:16,right:16,zIndex:150,display:"flex",gap:6}}>
-          <button className="xbtn xl" onClick={() => exportXLSX(monthlyExportCases, `SepsisTrack_Monthly_Report_${thisMonth}.xlsx`)}>
-            📥 Export This Month — Excel ({monthlyExportCases.length} cases)
-          </button>
-          <button className="xbtn csv" onClick={() => exportCSV(monthlyExportCases, `SepsisTrack_Monthly_Report_${thisMonth}.csv`)}>
-            CSV
-          </button>
-        </div>
+        {isAdmin && (
+          <div style={{position:"fixed",bottom:16,right:16,zIndex:150,display:"flex",gap:6}}>
+            <button className="xbtn xl" onClick={() => exportXLSX(monthlyExportCases, `SepsisTrack_Monthly_Report_${thisMonth}.xlsx`)}>
+              📥 Export This Month — Excel ({monthlyExportCases.length} cases)
+            </button>
+            <button className="xbtn csv" onClick={() => exportCSV(monthlyExportCases, `SepsisTrack_Monthly_Report_${thisMonth}.csv`)}>
+              CSV
+            </button>
+          </div>
+        )}
 
         {/* Forms / modals */}
         {showForm  && <PatientForm onSave={addCase} onClose={() => setShowForm(false)} />}
@@ -882,10 +884,16 @@ function HistoryView({ cases, onDetail, exportCSV, exportXLSX, isAdmin, onDelete
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
         <div className="stitle" style={{margin:0}}>📂 SEPSIS CASE HISTORY ({filtered.length} / {cases.length})</div>
-        <div style={{display:"flex",gap:6}}>
-          <button className="xbtn xl" onClick={() => exportXLSX(filtered,`SepsisTrack_History_${new Date().toISOString().slice(0,10)}.xlsx`)}>📥 Export Excel</button>
-          <button className="xbtn csv" onClick={() => exportCSV(filtered,`SepsisTrack_History_${new Date().toISOString().slice(0,10)}.csv`)}>CSV</button>
-        </div>
+        {isAdmin ? (
+          <div style={{display:"flex",gap:6}}>
+            <button className="xbtn xl" onClick={() => exportXLSX(filtered,`SepsisTrack_History_${new Date().toISOString().slice(0,10)}.xlsx`)}>📥 Export Excel</button>
+            <button className="xbtn csv" onClick={() => exportCSV(filtered,`SepsisTrack_History_${new Date().toISOString().slice(0,10)}.csv`)}>CSV</button>
+          </div>
+        ) : (
+          <span style={{fontSize:".68rem",color:"var(--muted)",display:"flex",alignItems:"center",gap:5}}>
+            🔐 Admin login required to export
+          </span>
+        )}
       </div>
 
       <div className="tfilters">
@@ -962,7 +970,7 @@ function HistoryView({ cases, onDetail, exportCSV, exportXLSX, isAdmin, onDelete
 // ═══════════════════════════════════════════════════════════════════════════════
 // Monthly View
 // ═══════════════════════════════════════════════════════════════════════════════
-function MonthlyView({ cases, exportCSV, exportXLSX }) {
+function MonthlyView({ cases, exportCSV, exportXLSX, isAdmin }) {
   const months = [...new Set(cases.map(c => (c.CompletedTime||c.SepsisRecognitionTime||"").slice(0,7)))].filter(Boolean).sort().reverse();
   const [selMonth, setSelMonth] = useState(months[0] || new Date().toISOString().slice(0,7));
 
@@ -985,10 +993,16 @@ function MonthlyView({ cases, exportCSV, exportXLSX }) {
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
         <div className="stitle" style={{margin:0}}>📅 MONTHLY QUALITY IMPROVEMENT REPORT</div>
-        <div style={{display:"flex",gap:6}}>
-          <button className="xbtn xl" onClick={() => exportXLSX(mCases, `SepsisTrack_Monthly_Report_${selMonth}.xlsx`)}>📥 Excel</button>
-          <button className="xbtn csv" onClick={() => exportCSV(mCases, `SepsisTrack_Monthly_Report_${selMonth}.csv`)}>CSV</button>
-        </div>
+        {isAdmin ? (
+          <div style={{display:"flex",gap:6}}>
+            <button className="xbtn xl" onClick={() => exportXLSX(mCases, `SepsisTrack_Monthly_Report_${selMonth}.xlsx`)}>📥 Excel</button>
+            <button className="xbtn csv" onClick={() => exportCSV(mCases, `SepsisTrack_Monthly_Report_${selMonth}.csv`)}>CSV</button>
+          </div>
+        ) : (
+          <span style={{fontSize:".68rem",color:"var(--muted)",display:"flex",alignItems:"center",gap:5}}>
+            🔐 Admin login required to export
+          </span>
+        )}
       </div>
 
       <div className="mselect">
@@ -1106,7 +1120,7 @@ function MonthlyView({ cases, exportCSV, exportXLSX }) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Report View
 // ═══════════════════════════════════════════════════════════════════════════════
-function ReportView({ cases, completed, withinHour, avgMin, compliance, exportCSV, exportXLSX }) {
+function ReportView({ cases, completed, withinHour, avgMin, compliance, exportCSV, exportXLSX, isAdmin }) {
   const delayCounts = {};
   DELAY_REASONS.forEach(r => delayCounts[r]=0);
   cases.forEach(c => { if(c.DelayReason && delayCounts[c.DelayReason]!==undefined) delayCounts[c.DelayReason]++; });
@@ -1119,10 +1133,16 @@ function ReportView({ cases, completed, withinHour, avgMin, compliance, exportCS
     <div>
       <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12,flexWrap:"wrap",gap:8}}>
         <div className="stitle" style={{margin:0}}>📊 OVERALL QI REPORT — ALL TIME</div>
-        <div style={{display:"flex",gap:6}}>
-          <button className="xbtn xl" onClick={() => exportXLSX(completed,`SepsisTrack_All_Cases_${new Date().toISOString().slice(0,10)}.xlsx`)}>📥 All Data Excel</button>
-          <button className="xbtn csv" onClick={() => exportCSV(completed,`SepsisTrack_All_Cases_${new Date().toISOString().slice(0,10)}.csv`)}>CSV</button>
-        </div>
+        {isAdmin ? (
+          <div style={{display:"flex",gap:6}}>
+            <button className="xbtn xl" onClick={() => exportXLSX(completed,`SepsisTrack_All_Cases_${new Date().toISOString().slice(0,10)}.xlsx`)}>📥 All Data Excel</button>
+            <button className="xbtn csv" onClick={() => exportCSV(completed,`SepsisTrack_All_Cases_${new Date().toISOString().slice(0,10)}.csv`)}>CSV</button>
+          </div>
+        ) : (
+          <span style={{fontSize:".68rem",color:"var(--muted)",display:"flex",alignItems:"center",gap:5}}>
+            🔐 Admin login required to export
+          </span>
+        )}
       </div>
       <div className="rgrid">
         {[

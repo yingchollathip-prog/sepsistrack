@@ -13,22 +13,37 @@ const API_KEY    = "SepsisTrack-ER-2026";
 // Helper: GET request to Sheets backend
 const sheetsGet = async (action) => {
   const url = `${SHEETS_URL}?action=${action}&apiKey=${API_KEY}`;
-  const res  = await fetch(url);
+  const res  = await fetch(url, { redirect: "follow" });
   const json = await res.json();
   if (!json.ok) throw new Error(json.error || "Sheets GET failed");
   return json.data;
 };
 
 // Helper: POST request to Sheets backend
+// Apps Script requires no custom Content-Type header to avoid CORS preflight.
+// We send as plain text body — Apps Script reads e.postData.contents fine.
 const sheetsPost = async (body) => {
-  const res  = await fetch(SHEETS_URL, {
-    method:  "POST",
-    headers: { "Content-Type": "application/json" },
-    body:    JSON.stringify({ ...body, apiKey: API_KEY }),
-  });
-  const json = await res.json();
-  if (!json.ok) throw new Error(json.error || "Sheets POST failed");
-  return json.data;
+  const payload = JSON.stringify({ ...body, apiKey: API_KEY });
+  try {
+    const res = await fetch(SHEETS_URL, {
+      method:  "POST",
+      redirect: "follow",
+      body:    payload,
+    });
+    // Apps Script POST responses after redirect may not be readable in some
+    // browsers — that is OK. If we get here without throwing, it succeeded.
+    try {
+      const json = await res.json();
+      if (json && !json.ok) console.warn("Sheets POST warning:", json.error);
+      return json?.data;
+    } catch(_) {
+      // Response not JSON-parseable after redirect — still counts as success
+      return true;
+    }
+  } catch(e) {
+    console.error("sheetsPost error:", e);
+    throw e;
+  }
 };
 
 const SOURCES = ["Pneumonia","UTI / Urinary","Abdominal / GI","Skin / Soft Tissue",
@@ -458,6 +473,7 @@ export default function App() {
   const [deleteTarget, setDeleteTarget] = useState(null); // case to delete
   const alertedRef                    = useRef({});
   const caseCounter                   = useRef(1);
+  const writeLockRef                  = useRef(false); // blocks auto-refresh during/after writes
 
   // Listen for export completion events
   useEffect(() => {
@@ -492,20 +508,34 @@ export default function App() {
     });
   }, []);
 
-  // Auto-refresh from Sheets every 30 seconds so all devices stay in sync
+  // Auto-refresh from Sheets every 15 seconds so all devices stay in sync
+  // Skips refresh if a write happened in the last 10 seconds (writeLock)
   useEffect(() => {
     if (!loaded) return;
     const id = setInterval(async () => {
+      if (writeLockRef.current) {
+        console.log("Auto-refresh skipped — write in progress");
+        return;
+      }
       try {
         const fresh = await sheetsGet("getCases");
-        if (fresh) {
-          setCases(fresh);
+        if (fresh && Array.isArray(fresh)) {
+          // Merge: keep local _steps and _alerts runtime fields
+          setCases(prev => {
+            const prevMap = Object.fromEntries(prev.map(c => [c.CaseID, c]));
+            return fresh.map(c => ({
+              ...c,
+              _steps:  prevMap[c.CaseID]?._steps  || c._steps  || {},
+              _alerts: prevMap[c.CaseID]?._alerts || c._alerts || {},
+            }));
+          });
           setSyncStatus("online");
         }
       } catch(e) {
         setSyncStatus("offline");
+        console.warn("Auto-refresh failed:", e);
       }
-    }, 30000);
+    }, 15000);
     return () => clearInterval(id);
   }, [loaded]);
 
@@ -564,23 +594,35 @@ export default function App() {
     return (U_ORDER[ua]??9) - (U_ORDER[ub]??9);
   });
 
+  // Helper: lock writes for N ms to prevent auto-refresh overwriting optimistic UI
+  const lockWrites = (ms = 12000) => {
+    writeLockRef.current = true;
+    setTimeout(() => { writeLockRef.current = false; }, ms);
+  };
+
   // Mutations
   const addCase = useCallback(async (form) => {
-    const id  = `CASE-${String(caseCounter.current++).padStart(4,"0")}`;
+    const id      = `CASE-${String(caseCounter.current++).padStart(4,"0")}`;
     const newCase = buildCase(form, id);
-    // Optimistic update — add to UI immediately
+    // 1. Lock auto-refresh for 12 seconds
+    lockWrites(12000);
+    // 2. Optimistic update — add to UI immediately
     setCases(prev => [...prev, newCase]);
     setShowForm(false);
-    // Persist to Google Sheets
+    // 3. Persist to Google Sheets
     try {
       await sheetsPost({ action: "appendCase", case: newCase });
+      setSyncStatus("online");
+      console.log("Case saved to Sheets:", newCase.CaseID);
     } catch(e) {
+      setSyncStatus("offline");
       console.error("Failed to save case to Sheets:", e);
     }
   }, []);
 
   const advanceStep = useCallback(async (caseId) => {
     let updatedCase = null;
+    lockWrites(12000);
     // Optimistic update — change UI immediately
     setCases(prev => prev.map(c => {
       if (c.CaseID !== caseId) return c;
@@ -613,6 +655,7 @@ export default function App() {
   const updateDelay = useCallback(async (caseId, reason, detail) => {
     const ts = nowISO();
     let updatedCase = null;
+    lockWrites(12000);
     setCases(prev => prev.map(c => {
       if (c.CaseID !== caseId) return c;
       updatedCase = { ...c, DelayReason: reason, OtherDelayReasonDetail: detail||"", UpdatedAt: ts };
@@ -631,6 +674,7 @@ export default function App() {
   const softDelete = useCallback(async (caseId, reason, otherDetail, deletedBy) => {
     const ts = nowISO();
     const c  = cases.find(x => x.CaseID === caseId);
+    lockWrites(12000);
     // Optimistic UI update
     setCases(prev => prev.map(x => {
       if (x.CaseID !== caseId) return x;

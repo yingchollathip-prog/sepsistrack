@@ -459,7 +459,7 @@ input,select,textarea,button{font-family:var(--mono);}
 // App
 // ═══════════════════════════════════════════════════════════════════════════════
 // ── Admin context (simple PIN-based for ER use) ───────────────────────────────
-const ADMIN_PIN = "1669"; // Change in production
+const ADMIN_PIN = "1234"; // Change in production
 
 // ── Helper: convert a raw Sheets row-object into a full React case object ─────
 const sheetsCaseToLocal = (c) => {

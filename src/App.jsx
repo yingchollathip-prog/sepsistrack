@@ -6,6 +6,31 @@ const DEADLINE_SEC = 60 * 60;
 const STORAGE_KEY  = "sepsis_cases_v4";
 const AUDIT_KEY    = "sepsis_audit_v4";
 
+// ─── Google Sheets Backend Config ────────────────────────────────────────────
+const SHEETS_URL = "https://script.google.com/macros/s/AKfycbx2pTp_HDxIAoEC-fm7QrrwVnuwfJu9A08eenPudasFd3vnG_nwTqxHOn65BUt8INSlfQ/exec";
+const API_KEY    = "SepsisTrack-ER-2026";
+
+// Helper: GET request to Sheets backend
+const sheetsGet = async (action) => {
+  const url = `${SHEETS_URL}?action=${action}&apiKey=${API_KEY}`;
+  const res  = await fetch(url);
+  const json = await res.json();
+  if (!json.ok) throw new Error(json.error || "Sheets GET failed");
+  return json.data;
+};
+
+// Helper: POST request to Sheets backend
+const sheetsPost = async (body) => {
+  const res  = await fetch(SHEETS_URL, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify({ ...body, apiKey: API_KEY }),
+  });
+  const json = await res.json();
+  if (!json.ok) throw new Error(json.error || "Sheets POST failed");
+  return json.data;
+};
+
 const SOURCES = ["Pneumonia","UTI / Urinary","Abdominal / GI","Skin / Soft Tissue",
   "Bacteremia / Unknown","CNS / Meningitis","Endocarditis","Bone / Joint","Other"];
 const ANTIBIOTICS = ["Piperacillin-Tazobactam (Tazocin)","Meropenem","Ceftriaxone",
@@ -76,23 +101,35 @@ const buildCase = (form, id) => {
   };
 };
 
-// ─── Persistent Storage (window.storage API) ──────────────────────────────────
+// ─── Persistent Storage — Google Sheets backend ──────────────────────────────
+// load/loadAudit: fetch from Sheets on startup
+// save: no-op (we use granular appendCase/updateCase instead)
+// saveAudit: no-op (appendAudit is called directly per entry)
 const persist = {
   async load() {
-    try { const r = await window.storage.get(STORAGE_KEY); return r ? JSON.parse(r.value) : null; }
-    catch { return null; }
+    try { return await sheetsGet("getCases"); }
+    catch(e) { console.error("Sheets load failed, falling back to localStorage", e);
+      try { const r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : []; }
+      catch { return []; }
+    }
   },
   async save(cases) {
-    try { await window.storage.set(STORAGE_KEY, JSON.stringify(cases)); }
-    catch(e) { console.error("Storage save failed", e); }
+    // Granular saves handled by appendCase/updateCase/softDelete
+    // Full save only as fallback to localStorage for offline resilience
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(cases)); }
+    catch(e) { /* ignore */ }
   },
   async loadAudit() {
-    try { const r = await window.storage.get(AUDIT_KEY); return r ? JSON.parse(r.value) : []; }
-    catch { return []; }
+    try { return await sheetsGet("getAudit"); }
+    catch(e) { console.error("Sheets audit load failed", e);
+      try { const r = localStorage.getItem(AUDIT_KEY); return r ? JSON.parse(r) : []; }
+      catch { return []; }
+    }
   },
   async saveAudit(log) {
-    try { await window.storage.set(AUDIT_KEY, JSON.stringify(log)); }
-    catch(e) { console.error("Audit save failed", e); }
+    // Audit entries appended individually via appendAudit — no bulk save needed
+    try { localStorage.setItem(AUDIT_KEY, JSON.stringify(log)); }
+    catch(e) { /* ignore */ }
   },
 };
 
@@ -432,13 +469,15 @@ export default function App() {
     return () => window.removeEventListener("sepsis_exported", handler);
   }, []);
 
-  // Load from storage — empty by default (no seed data)
+  const [syncStatus, setSyncStatus] = useState("loading"); // loading | online | offline
+
+  // Load from Google Sheets on startup
   useEffect(() => {
+    setSyncStatus("loading");
     Promise.all([persist.load(), persist.loadAudit()]).then(([saved, audit]) => {
-      // Assign correct next CaseID counter
       if (saved && saved.length) {
         const maxId = saved.reduce((mx, c) => {
-          const n = parseInt((c.CaseID || "").replace(/\D/g,""), 10);
+          const n = parseInt((c.CaseID || "").replace(/[^0-9]/g,""), 10);
           return n > mx ? n : mx;
         }, 0);
         caseCounter.current = maxId + 1;
@@ -446,8 +485,29 @@ export default function App() {
       setCases(saved || []);
       setAuditLog(audit || []);
       setLoaded(true);
+      setSyncStatus("online");
+    }).catch(() => {
+      setLoaded(true);
+      setSyncStatus("offline");
     });
   }, []);
+
+  // Auto-refresh from Sheets every 30 seconds so all devices stay in sync
+  useEffect(() => {
+    if (!loaded) return;
+    const id = setInterval(async () => {
+      try {
+        const fresh = await sheetsGet("getCases");
+        if (fresh) {
+          setCases(fresh);
+          setSyncStatus("online");
+        }
+      } catch(e) {
+        setSyncStatus("offline");
+      }
+    }, 30000);
+    return () => clearInterval(id);
+  }, [loaded]);
 
   // Save whenever cases change
   useEffect(() => {
@@ -505,19 +565,29 @@ export default function App() {
   });
 
   // Mutations
-  const addCase = useCallback((form) => {
-    const id = `CASE-${String(caseCounter.current++).padStart(4,"0")}`;
-    setCases(prev => [...prev, buildCase(form, id)]);
+  const addCase = useCallback(async (form) => {
+    const id  = `CASE-${String(caseCounter.current++).padStart(4,"0")}`;
+    const newCase = buildCase(form, id);
+    // Optimistic update — add to UI immediately
+    setCases(prev => [...prev, newCase]);
     setShowForm(false);
+    // Persist to Google Sheets
+    try {
+      await sheetsPost({ action: "appendCase", case: newCase });
+    } catch(e) {
+      console.error("Failed to save case to Sheets:", e);
+    }
   }, []);
 
-  const advanceStep = useCallback((caseId) => {
+  const advanceStep = useCallback(async (caseId) => {
+    let updatedCase = null;
+    // Optimistic update — change UI immediately
     setCases(prev => prev.map(c => {
       if (c.CaseID !== caseId) return c;
       const ts = nowISO();
       const updated = { ...c, UpdatedAt: ts };
-      if (!updated.ATBOrderTime)     { updated.ATBOrderTime = ts; updated._steps = {...c._steps, ordered: ts}; }
-      else if (!updated.ATBPreparedTime) { updated.ATBPreparedTime = ts; updated._steps = {...c._steps, prepared: ts}; }
+      if (!updated.ATBOrderTime)         { updated.ATBOrderTime = ts;     updated._steps = {...c._steps, ordered: ts}; }
+      else if (!updated.ATBPreparedTime) { updated.ATBPreparedTime = ts;  updated._steps = {...c._steps, prepared: ts}; }
       else if (!updated.ATBAdministeredTime) {
         updated.ATBAdministeredTime = ts;
         updated.CompletedTime = ts;
@@ -527,25 +597,46 @@ export default function App() {
         updated.WithinOneHour = total !== null ? (total <= 60 ? "Yes" : "No") : null;
         updated._steps = {...c._steps, administered: ts};
       }
+      updatedCase = updated;
       return updated;
     }));
+    // Persist to Google Sheets
+    if (updatedCase) {
+      try {
+        await sheetsPost({ action: "updateCase", case: updatedCase });
+      } catch(e) {
+        console.error("Failed to sync step to Sheets:", e);
+      }
+    }
   }, []);
 
-  const updateDelay = useCallback((caseId, reason, detail) => {
-    setCases(prev => prev.map(c =>
-      c.CaseID !== caseId ? c : { ...c, DelayReason: reason, OtherDelayReasonDetail: detail||"", UpdatedAt: nowISO() }
-    ));
+  const updateDelay = useCallback(async (caseId, reason, detail) => {
+    const ts = nowISO();
+    let updatedCase = null;
+    setCases(prev => prev.map(c => {
+      if (c.CaseID !== caseId) return c;
+      updatedCase = { ...c, DelayReason: reason, OtherDelayReasonDetail: detail||"", UpdatedAt: ts };
+      return updatedCase;
+    }));
+    if (updatedCase) {
+      try {
+        await sheetsPost({ action: "updateCase", case: { CaseID: caseId, DelayReason: reason, OtherDelayReasonDetail: detail||"", UpdatedAt: ts } });
+      } catch(e) {
+        console.error("Failed to sync delay reason to Sheets:", e);
+      }
+    }
   }, []);
 
   // Soft-delete: marks IsDeleted=true, appends audit entry
-  const softDelete = useCallback((caseId, reason, otherDetail, deletedBy) => {
+  const softDelete = useCallback(async (caseId, reason, otherDetail, deletedBy) => {
     const ts = nowISO();
-    setCases(prev => prev.map(c => {
-      if (c.CaseID !== caseId) return c;
-      return { ...c, IsDeleted: true, DeletedAt: ts, DeletedBy: deletedBy,
+    const c  = cases.find(x => x.CaseID === caseId);
+    // Optimistic UI update
+    setCases(prev => prev.map(x => {
+      if (x.CaseID !== caseId) return x;
+      return { ...x, IsDeleted: true, DeletedAt: ts, DeletedBy: deletedBy,
                DeleteReason: reason, DeleteReasonDetail: otherDetail||"", UpdatedAt: ts };
     }));
-    const c = cases.find(x => x.CaseID === caseId);
     if (c) {
       const entry = {
         AuditID: `AUDIT-${Date.now()}`,
@@ -556,6 +647,18 @@ export default function App() {
         ActionType: "SOFT_DELETE",
       };
       setAuditLog(prev => [...prev, entry]);
+      // Persist to Google Sheets
+      try {
+        await sheetsPost({
+          action: "softDelete",
+          CaseID: caseId, HN: c.HN, BedNumber: c.BedNumber,
+          PatientName: c.PatientName, PreviousStatus: c.Status,
+          DeletedBy: deletedBy, DeleteReason: reason,
+          DeleteReasonDetail: otherDetail||"",
+        });
+      } catch(e) {
+        console.error("Failed to sync soft-delete to Sheets:", e);
+      }
     }
     setDeleteTarget(null);
   }, [cases]);
@@ -566,6 +669,20 @@ export default function App() {
   const thisMonth = new Date().toISOString().slice(0,7);
   const monthlyExportCases = completedCases.filter(c => (c.CompletedTime||"").slice(0,7) === thisMonth);
 
+  // Show loading screen while fetching from Sheets
+  if (!loaded) return (
+    <>
+      <style>{CSS}</style>
+      <div style={{minHeight:"100vh",background:"var(--bg)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:16}}>
+        <div style={{fontFamily:"var(--head)",fontSize:"1.5rem",fontWeight:800,color:"var(--text)"}}>⚕ SEPSIS<span style={{color:"var(--red)"}}>TRACK</span></div>
+        <div style={{fontSize:".8rem",color:"var(--muted)"}}>Connecting to Google Sheets…</div>
+        <div style={{width:200,height:4,background:"var(--border)",borderRadius:2,overflow:"hidden"}}>
+          <div style={{width:"60%",height:"100%",background:"var(--accent)",borderRadius:2,animation:"blink 1s infinite"}}/>
+        </div>
+      </div>
+    </>
+  );
+
   return (
     <>
       <style>{CSS}</style>
@@ -575,6 +692,12 @@ export default function App() {
           <div style={{display:"flex",alignItems:"center",gap:10}}>
             <div className="logo">⚕ SEPSIS<em>TRACK</em></div>
             <span className="livebadge">LIVE</span>
+            <span className="livebadge" style={{
+              background: syncStatus==="online"?"#00695c": syncStatus==="offline"?"#c62828":"#555",
+              animation: syncStatus==="loading"?"blink 1s infinite":"none",
+            }}>
+              {syncStatus==="online"?"☁ SYNCED": syncStatus==="offline"?"⚠ OFFLINE":"⟳ CONNECTING"}
+            </span>
             {overdueCases.length > 0 && <span className="livebadge" style={{background:"#c62828"}}>⚠ {overdueCases.length} OVERDUE</span>}
           </div>
           <nav className="nav">

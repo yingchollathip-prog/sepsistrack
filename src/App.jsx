@@ -619,29 +619,50 @@ export default function App() {
   const addCase = useCallback(async (form) => {
     const id = `CASE-${String(caseCounter.current++).padStart(4,"0")}`;
     const nc = buildCase(form, id);
+
+    console.log("💾 Saving new case:", id, nc.PatientName, nc.HN, nc.BedNumber);
+
+    // Validate required fields before sending
+    if (!nc.HN || !nc.PatientName || !nc.BedNumber) {
+      setSaveError("Missing required fields: HN, Patient Name, or Bed Number.");
+      setTimeout(() => setSaveError(null), 5000);
+      return;
+    }
+
     isSavingRef.current = true;
     setSavingCaseId(id);
     setShowForm(false);
-    console.log("💾 Saving new case:", id, nc.PatientName);
+
+    // Optimistic insert so user sees the patient immediately
+    setCases(prev => [...prev, nc]);
+
     try {
-      await sheetsCall({
-        action: "newCase", CaseID: nc.CaseID,
-        HN: nc.HN, PatientName: nc.PatientName, BedNumber: nc.BedNumber,
-        ArrivalTime: nc.ArrivalTime || "",
+      const payload = {
+        action:                "newCase",
+        CaseID:                nc.CaseID,
+        HN:                    nc.HN,
+        PatientName:           nc.PatientName,
+        BedNumber:             nc.BedNumber,
+        ArrivalTime:           nc.ArrivalTime           || "",
         SepsisRecognitionTime: nc.SepsisRecognitionTime || "",
-        SuspectedSource: nc.SuspectedSource || "",
-        PlannedAntibiotic: nc.PlannedAntibiotic || "",
-        OrderingPhysician: nc.OrderingPhysician || "",
-        Status: "active", CreatedBy: nc.CreatedBy || "ER Nurse",
-        CreatedAt: nc.CreatedAt,
-      });
-      console.log("✅ newCase saved, re-fetching...");
+        SuspectedSource:       nc.SuspectedSource       || "",
+        PlannedAntibiotic:     nc.PlannedAntibiotic     || "",
+        OrderingPhysician:     nc.OrderingPhysician     || "",
+        Status:                "active",
+        CreatedBy:             nc.CreatedBy             || "ER Nurse",
+        CreatedAt:             nc.CreatedAt,
+      };
+      console.log("📤 Sending to Sheets:", JSON.stringify(payload));
+      const result = await sheetsCall(payload);
+      console.log("✅ newCase response:", JSON.stringify(result));
+      // Re-fetch to confirm Sheets saved correctly
       await fetchAndSetCases();
     } catch(e) {
       setSyncStatus("offline");
-      setSaveError("Failed to register patient. Please try again.");
+      setSaveError("Failed to save patient to Google Sheets. Patient shown locally only. Error: " + e.message);
       console.error("❌ newCase failed:", e.message);
-      setTimeout(() => setSaveError(null), 5000);
+      setTimeout(() => setSaveError(null), 8000);
+      // Keep optimistic insert in UI so nurse can still work offline
     } finally {
       isSavingRef.current = false;
       setSavingCaseId(null);
